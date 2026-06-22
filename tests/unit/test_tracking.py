@@ -369,7 +369,7 @@ class TestSelectBestBall:
 
         static_line = _ball_box(35, 48, 65, 52, confidence=0.92)
         moving_ball = _ball(80, 80, confidence=0.28)
-        previous_ball = _ball(50, 50, confidence=0.9)
+        previous_ball = _ball(76, 76, confidence=0.9)
 
         best = select_best_ball(
             [static_line, moving_ball],
@@ -420,3 +420,37 @@ class TestSelectBestBall:
 
         assert not has_local_ball_motion(static_line, previous, current)
         assert has_local_ball_motion(moving_ball, previous, current)
+
+    def test_returns_none_instead_of_static_line_when_track_exists(self) -> None:
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = previous.copy()
+        previous[18:23, 18:23] = 255
+        current[18:23, 18:23] = 255
+
+        static_line = _ball(20, 20, confidence=0.95)
+        previous_ball = _ball(22, 22, confidence=0.8)
+
+        best = select_best_ball(
+            [static_line],
+            previous_frame=previous,
+            current_frame=current,
+            previous_ball=previous_ball,
+        )
+
+        assert best is None
+
+    def test_initial_acquisition_requires_motion_when_frames_available(self) -> None:
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = previous.copy()
+        previous[18:23, 18:23] = 255
+        current[18:23, 18:23] = 255
+
+        static_line = _ball(20, 20, confidence=0.95)
+
+        best = select_best_ball(
+            [static_line],
+            previous_frame=previous,
+            current_frame=current,
+        )
+
+        assert best is None

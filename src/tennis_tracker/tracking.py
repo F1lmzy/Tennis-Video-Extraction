@@ -345,12 +345,18 @@ def select_best_ball(
             det for det in moving_detections
             if _center_distance(det, previous_ball) <= max_proximity_px
         ]
-        # Prefer a moving candidate that is close to the previous confirmed
-        # ball location.  This prevents jumping to unrelated white court-line
-        # fragments elsewhere in the frame.
-        candidates = near_moving_detections or moving_detections or detections
+        # Once a moving ball track exists, do not fall back to static or far-away
+        # detections.  Returning None is preferable because the smoothing layer
+        # can interpolate short gaps, while accepting a court line corrupts the
+        # trajectory and makes following frames lock onto the wrong object.
+        candidates = near_moving_detections
     else:
-        candidates = moving_detections or detections
+        # During initial acquisition, require local motion when frame context is
+        # available.  This avoids bootstrapping the track from a static line.
+        candidates = moving_detections
+
+    if not candidates:
+        return None
 
     def score(det: BallDetection) -> float:
         motion_score = motion_by_detection[det]
