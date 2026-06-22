@@ -112,7 +112,7 @@ def main() -> None:
     process_parser.add_argument(
         "--top-view-court",
         choices=["singles", "doubles"],
-        default="singles",
+        default="doubles",
         help="Court width used by the side 2D top-view panel",
     )
 

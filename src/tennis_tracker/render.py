@@ -62,14 +62,17 @@ def _court_to_panel(
     panel_width: int,
     panel_height: int,
     court_width_m: float = DOUBLES_WIDTH,
+    padding_px: int = 20,
 ) -> tuple[int, int]:
     """Convert court-meter coordinates to panel pixel coordinates.
 
     The panel Y-axis is inverted so that +Y (far baseline) goes upward,
     matching typical top-down orientation.
     """
-    scale_x = panel_width / court_width_m
-    scale_y = panel_height / DOUBLES_LENGTH
+    drawable_width = max(1, panel_width - 2 * padding_px)
+    drawable_height = max(1, panel_height - 2 * padding_px)
+    scale_x = drawable_width / court_width_m
+    scale_y = drawable_height / DOUBLES_LENGTH
     # Use a uniform scale to preserve aspect ratio
     scale = min(scale_x, scale_y)
     cx = panel_width / 2.0
@@ -107,6 +110,7 @@ def _draw_court_panel(
             panel_width,
             panel_height,
             court_width_m=active_width,
+            padding_px=20,
         )
 
     # ── Active court area fill ──

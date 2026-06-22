@@ -373,7 +373,7 @@ def run_process(
     flip_court_x: bool = False,
     flip_court_y: bool = False,
     ball_projection_anchor: str = "bottom_center",
-    top_view_court: str = "singles",
+    top_view_court: str = "doubles",
 ) -> dict:
     """Run the real (or mocked) detection-based process pipeline.
 
