@@ -92,6 +92,7 @@ def smooth_output_rows(
         - player_a_x_m, player_a_y_m
         - player_b_x_m, player_b_y_m
         - ball_x_m, ball_y_m
+        - ball_pixel_x, ball_pixel_y
 
     Confidence fields are NOT interpolated — they propagate from the nearest
     known observation (backward fill) so interpolated positions retain a
@@ -124,6 +125,8 @@ def smooth_output_rows(
     raw_b_y = [r.player_b_y_m for r in rows]
     raw_ball_x = [r.ball_x_m for r in rows]
     raw_ball_y = [r.ball_y_m for r in rows]
+    raw_ball_pixel_x = [r.ball_pixel_x for r in rows]
+    raw_ball_pixel_y = [r.ball_pixel_y for r in rows]
 
     # Interpolate
     smooth_a_x = _interpolate_1d(raw_a_x, max_interp_gap)
@@ -132,6 +135,8 @@ def smooth_output_rows(
     smooth_b_y = _interpolate_1d(raw_b_y, max_interp_gap)
     smooth_ball_x = _interpolate_1d(raw_ball_x, max_interp_gap)
     smooth_ball_y = _interpolate_1d(raw_ball_y, max_interp_gap)
+    smooth_ball_pixel_x = _interpolate_1d(raw_ball_pixel_x, max_interp_gap)
+    smooth_ball_pixel_y = _interpolate_1d(raw_ball_pixel_y, max_interp_gap)
 
     # Confidence propagation: backward fill from nearest known observation
     def _backward_fill(values: list[Optional[float]]) -> list[Optional[float]]:
@@ -168,8 +173,8 @@ def smooth_output_rows(
                 player_b_confidence=bfill_b_conf[i],
                 ball_x_m=smooth_ball_x[i],
                 ball_y_m=smooth_ball_y[i],
-                ball_pixel_x=row.ball_pixel_x,
-                ball_pixel_y=row.ball_pixel_y,
+                ball_pixel_x=smooth_ball_pixel_x[i],
+                ball_pixel_y=smooth_ball_pixel_y[i],
                 ball_confidence=bfill_ball_conf[i],
                 court_confidence=row.court_confidence,
                 homography_valid=row.homography_valid,

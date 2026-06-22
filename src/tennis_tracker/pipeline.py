@@ -622,7 +622,7 @@ def run_process(
     if video_output_path:
         render_annotated_video(
             video_path,
-            raw_rows,
+            smoothed_rows,
             video_output_path,
             fps=fps,
         )

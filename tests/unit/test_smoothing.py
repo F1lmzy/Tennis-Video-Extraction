@@ -60,6 +60,25 @@ class TestInterpolation:
             assert r.ball_x_m == s.ball_x_m
             assert r.ball_y_m == s.ball_y_m
 
+    def test_short_gap_in_ball_pixels_is_interpolated_without_homography(self) -> None:
+        """Pixel positions should smooth even when court-meter coords are unavailable."""
+        rows = [
+            _row(0, 0.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=None, bally=None),
+            _row(1, 1.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=None, bally=None),
+            _row(2, 2.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=None, bally=None),
+        ]
+        rows[0].ball_pixel_x = 100.0
+        rows[0].ball_pixel_y = 50.0
+        rows[2].ball_pixel_x = 120.0
+        rows[2].ball_pixel_y = 70.0
+
+        smoothed = smooth_output_rows(rows)
+
+        assert smoothed[1].ball_x_m is None
+        assert smoothed[1].ball_y_m is None
+        assert smoothed[1].ball_pixel_x == pytest.approx(110.0)
+        assert smoothed[1].ball_pixel_y == pytest.approx(60.0)
+
     def test_short_gap_in_ball_is_interpolated(self) -> None:
         """A single missing ball frame should be interpolated."""
         rows = [
