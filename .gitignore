@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Project artifacts
+.codegraph/
+data/input/
+data/output/
+data/datasets/
+runs/
+*.pt
+models/*.pt
+models/*.onnx
+models/*.xml
+models/*.bin
+models/*openvino*/
+
+# Notebooks derived artifacts
+notebooks/.ipynb_checkpoints/
+
+# Environment
+.env
+*.env.local
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
