@@ -19,6 +19,7 @@ from tennis_tracker.detection import (
     BoundingBox,
     CourtKeypointDetector,
     PlayerDetector,
+    ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS,
 )
 
 
@@ -317,8 +318,29 @@ class TestCourtKeypointDetector:
         assert len(keypoints) == 1
         assert keypoints[0].label == "kp1"
 
+    def test_default_roboflow_15_keypoint_mapping(self, dummy_image: np.ndarray) -> None:
+        """The known 15-point Roboflow court dataset should map to court labels."""
+        points = [[[float(i + 1), float(i + 2)] for i in range(15)]]
+        kps = FakeKeypoints(
+            xy=torch.tensor(points),
+            conf=torch.ones((1, 15)),
+        )
+        mock_model = _make_mock_model([FakeResult(keypoints=kps)])
+        detector = CourtKeypointDetector(model=mock_model)
+
+        keypoints = detector.predict(dummy_image, conf_threshold=0.0)
+
+        assert len(keypoints) == 15
+        assert keypoints[0].label == "doubles_near_left"
+        assert keypoints[4].label == "doubles_far_right"
+        assert keypoints[7].label == "doubles_far_left"
+        assert keypoints[14].label == "net_center"
+        assert [kp.label for kp in keypoints] == [
+            ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS[i] for i in range(15)
+        ]
+
     def test_unknown_keypoints_get_generic_labels(self, dummy_image: np.ndarray) -> None:
-        """When keypoint_labels is not provided, use generic labels."""
+        """When keypoint_labels is not provided for unknown counts, use generic labels."""
         kps = FakeKeypoints(
             xy=torch.tensor([[[50.0, 60.0], [70.0, 80.0]]]),
             conf=torch.tensor([[0.9, 0.8]]),

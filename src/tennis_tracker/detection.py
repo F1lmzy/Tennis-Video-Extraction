@@ -21,6 +21,25 @@ from tennis_tracker.types import PixelPoint
 COCO_PERSON_CLASS_ID: int = 0
 """COCO class ID for ``person``."""
 
+ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS: dict[int, str] = {
+    0: "doubles_near_left",
+    1: "singles_near_left",
+    2: "singles_near_right",
+    3: "doubles_near_right",
+    4: "doubles_far_right",
+    5: "singles_far_right",
+    6: "singles_far_left",
+    7: "doubles_far_left",
+    8: "service_far_left",
+    9: "service_far_center",
+    10: "service_far_right",
+    11: "service_near_right",
+    12: "service_near_center",
+    13: "service_near_left",
+    14: "net_center",
+}
+"""Default index→geometry labels for Roboflow abiya-thesis/tennis-court-suuzy."""
+
 
 # ── Shared types ───────────────────────────────────────────────────────
 
@@ -296,8 +315,9 @@ class CourtKeypointDetector:
     keypoint_labels:
         Mapping from model keypoint index (0-based) to court geometry
         label (e.g. ``{0: "doubles_near_left", 1: "doubles_near_right", ...}``).
-        If not provided, keypoints are returned with generic labels
-        ``keypoint_0``, ``keypoint_1`` etc.
+        If not provided and the model emits 15 keypoints, the default
+        Roboflow tennis-court-suuzy mapping is used. Other keypoint counts
+        fall back to generic labels ``keypoint_0``, ``keypoint_1`` etc.
     """
 
     def __init__(
@@ -363,6 +383,9 @@ class CourtKeypointDetector:
         # Take the first detected instance's keypoints
         kps_xy = kp_data.xy[0]
         kps_conf = kp_data.conf[0] if kp_data.conf is not None else None
+        keypoint_labels = self._keypoint_labels
+        if keypoint_labels is None and len(kps_xy) == 15:
+            keypoint_labels = ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS
 
         keypoints: list[CourtKeypoint] = []
         for i in range(len(kps_xy)):
@@ -378,8 +401,8 @@ class CourtKeypointDetector:
                 continue
 
             label = (
-                self._keypoint_labels[i]
-                if self._keypoint_labels and i in self._keypoint_labels
+                keypoint_labels[i]
+                if keypoint_labels and i in keypoint_labels
                 else f"keypoint_{i}"
             )
 
