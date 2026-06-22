@@ -372,6 +372,8 @@ def run_process(
     ball_min_initial_displacement_px: float = 2.0,
     flip_court_x: bool = False,
     flip_court_y: bool = False,
+    court_x_scale: float = 1.0,
+    court_y_scale: float = 1.0,
     ball_projection_anchor: str = "bottom_center",
     top_view_court: str = "doubles",
 ) -> dict:
@@ -554,7 +556,11 @@ def run_process(
                 cp = project_pixel_to_court(pixel, homography_matrix, det.confidence)
                 x_m = -cp.x_m if flip_court_x else cp.x_m
                 y_m = -cp.y_m if flip_court_y else cp.y_m
-                return {"x_m": x_m, "y_m": y_m, "conf": cp.confidence}
+                return {
+                    "x_m": x_m * court_x_scale,
+                    "y_m": y_m * court_y_scale,
+                    "conf": cp.confidence,
+                }
             except ValueError:
                 return None
 

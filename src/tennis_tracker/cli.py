@@ -104,6 +104,18 @@ def main() -> None:
         help="Flip projected court Y coordinates if near/far court direction is reversed",
     )
     process_parser.add_argument(
+        "--court-x-scale",
+        type=float,
+        default=1.0,
+        help="Scale projected court X coordinates; use <1.0 if side-to-side spread is too wide",
+    )
+    process_parser.add_argument(
+        "--court-y-scale",
+        type=float,
+        default=1.0,
+        help="Scale projected court Y coordinates; use <1.0 if lengthwise spread is too wide",
+    )
+    process_parser.add_argument(
         "--ball-projection-anchor",
         choices=["center", "bottom_center"],
         default="bottom_center",
@@ -240,6 +252,8 @@ def _handle_process(args: argparse.Namespace) -> None:
         ball_min_initial_displacement_px=args.ball_min_initial_displacement_px,
         flip_court_x=args.flip_court_x,
         flip_court_y=args.flip_court_y,
+        court_x_scale=args.court_x_scale,
+        court_y_scale=args.court_y_scale,
         ball_projection_anchor=args.ball_projection_anchor,
         top_view_court=args.top_view_court,
     )
