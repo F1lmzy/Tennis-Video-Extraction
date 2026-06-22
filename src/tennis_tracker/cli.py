@@ -116,6 +116,12 @@ def main() -> None:
         help="Scale projected court Y coordinates; use <1.0 if lengthwise spread is too wide",
     )
     process_parser.add_argument(
+        "--player-court-margin-m",
+        type=float,
+        default=1.0,
+        help="Allowed player distance outside the doubles court before filtering",
+    )
+    process_parser.add_argument(
         "--ball-projection-anchor",
         choices=["center", "bottom_center"],
         default="bottom_center",
@@ -254,6 +260,7 @@ def _handle_process(args: argparse.Namespace) -> None:
         flip_court_y=args.flip_court_y,
         court_x_scale=args.court_x_scale,
         court_y_scale=args.court_y_scale,
+        player_court_margin_m=args.player_court_margin_m,
         ball_projection_anchor=args.ball_projection_anchor,
         top_view_court=args.top_view_court,
     )

@@ -206,6 +206,42 @@ class TestPlayerTrackerContinuity:
         ])
         assert result.diagnostics.has_flag("ambigous_player_id")
 
+    def test_high_confidence_bystander_does_not_steal_track(self) -> None:
+        """After initialization, proximity beats confidence for extra people."""
+        tracker = PlayerTracker(max_match_distance=80.0)
+        tracker.update([
+            _player(0, 0, 10, 20, confidence=0.9),
+            _player(100, 0, 110, 20, confidence=0.8),
+        ])
+
+        result = tracker.update([
+            _player(2, 0, 12, 20, confidence=0.7),
+            _player(98, 0, 108, 20, confidence=0.7),
+            _player(300, 0, 310, 20, confidence=0.99),
+        ])
+
+        assert result.player_a is not None
+        assert result.player_b is not None
+        assert result.player_a.bbox.bottom_center.x == pytest.approx(7.0)
+        assert result.player_b.bbox.bottom_center.x == pytest.approx(103.0)
+        assert result.diagnostics.has_flag("ambigous_player_id")
+
+    def test_far_detections_do_not_swap_existing_tracks(self) -> None:
+        """Detections beyond max distance should not replace the tracked players."""
+        tracker = PlayerTracker(max_match_distance=40.0)
+        tracker.update([
+            _player(0, 0, 10, 20, confidence=0.9),
+            _player(100, 0, 110, 20, confidence=0.8),
+        ])
+
+        result = tracker.update([
+            _player(250, 0, 260, 20, confidence=0.99),
+            _player(320, 0, 330, 20, confidence=0.98),
+        ])
+
+        assert result.player_a is None
+        assert result.player_b is None
+
 
 class TestPlayerTrackerDiagnostics:
     """Tests for confidence-based diagnostics."""

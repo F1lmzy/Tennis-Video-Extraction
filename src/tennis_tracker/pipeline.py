@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from tennis_tracker.coordinates import estimate_homography, project_pixel_to_court
+from tennis_tracker.court import DOUBLES_LENGTH, DOUBLES_WIDTH
 from tennis_tracker.diagnostics import Diagnostics
 from tennis_tracker.output import TrackingCsvWriter
 from tennis_tracker.render import render_annotated_video
@@ -374,6 +375,7 @@ def run_process(
     flip_court_y: bool = False,
     court_x_scale: float = 1.0,
     court_y_scale: float = 1.0,
+    player_court_margin_m: float = 1.0,
     ball_projection_anchor: str = "bottom_center",
     top_view_court: str = "doubles",
 ) -> dict:
@@ -543,8 +545,32 @@ def run_process(
             else:
                 pending_ball = None
 
+        # ── Drop person detections that project clearly outside the playable
+        # court area before A/B assignment.  This prevents spectators, ball
+        # kids, or coaches visible in a fixed camera view from stealing player
+        # tracks.  If homography is unavailable, keep the raw detections.
+        filtered_player_dets = player_dets
+        if homography_matrix is not None:
+            filtered_player_dets = []
+            half_width = DOUBLES_WIDTH / 2.0 + player_court_margin_m
+            half_length = DOUBLES_LENGTH / 2.0 + player_court_margin_m
+            for det in player_dets:
+                try:
+                    court_point = project_pixel_to_court(
+                        det.bbox.bottom_center,
+                        homography_matrix,
+                        det.confidence,
+                    )
+                except ValueError:
+                    continue
+                if (
+                    -half_width <= court_point.x_m <= half_width
+                    and -half_length <= court_point.y_m <= half_length
+                ):
+                    filtered_player_dets.append(det)
+
         # ── Track players ──
-        tracked = tracker.update(player_dets, ball=best_ball)
+        tracked = tracker.update(filtered_player_dets, ball=best_ball)
 
         # ── Project to court coordinates ──
         def _project(det, anchor: str = "bottom_center") -> Optional[dict]:

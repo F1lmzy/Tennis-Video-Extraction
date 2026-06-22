@@ -135,17 +135,23 @@ class PlayerTracker:
 
         # --- Resolve player A/B ---
         if len(sorted_dets) >= 2:
-            # Have ≥2 detections — use top 2
-            chosen = sorted_dets[:2]
             if len(sorted_dets) > 2:
                 diag.add_flag("ambigous_player_id")
 
             state = self._state
-            if state is not None and state.player_a is not None and state.player_b is not None:
-                # Match to existing tracks by nearest neighbour
-                a_det, b_det = self._assign_by_proximity(chosen, state)
+            if state is not None and (state.player_a is not None or state.player_b is not None):
+                # Match against all current detections, not just the top two.
+                # This prevents high-confidence bystanders from stealing a
+                # track when the real player is still close to the previous
+                # position.
+                a_det, b_det = self._assign_by_proximity(
+                    sorted_dets,
+                    state,
+                    self._max_match_distance,
+                )
             else:
                 # No prior state — arbitrary assignment by confidence
+                chosen = sorted_dets[:2]
                 a_det, b_det = chosen[0], chosen[1]
 
         elif len(sorted_dets) == 1:
@@ -163,6 +169,11 @@ class PlayerTracker:
             diag.add_flag("missing_player_a")
             diag.add_flag("missing_player_b")
             a_det, b_det = None, None
+
+        if a_det is None:
+            diag.add_flag("missing_player_a")
+        if b_det is None:
+            diag.add_flag("missing_player_b")
 
         # --- Low-confidence diagnostics ---
         if a_det is not None and a_det.confidence < self._low_confidence_threshold:
@@ -210,6 +221,7 @@ class PlayerTracker:
     def _assign_by_proximity(
         detections: list[PlayerDetection],
         state: _TrackingState,
+        max_match_distance: float,
     ) -> tuple[Optional[PlayerDetection], Optional[PlayerDetection]]:
         """Greedy nearest-neighbour assignment of detections to tracks.
 
@@ -217,32 +229,78 @@ class PlayerTracker:
         whose nearest detection is farther than ``_max_match_distance``
         gets ``None``.
         """
-        # We only call this when both players are tracked and we have 2 detections
-        if len(detections) < 2:
-            return detections[0] if detections else None, None
+        if not detections:
+            return None, None
 
-        d_a, d_b = detections[0], detections[1]
+        def center(det: PlayerDetection) -> tuple[float, float]:
+            bc = det.bbox.bottom_center
+            return bc.x, bc.y
 
-        if state.player_a is None or state.player_b is None:
-            return d_a, d_b
+        def best_for_track(
+            track: Optional[_PlayerTrackState],
+            excluded: set[int],
+        ) -> tuple[Optional[int], float]:
+            if track is None:
+                return None, float("inf")
+            best_idx: Optional[int] = None
+            best_dist = float("inf")
+            for idx, det in enumerate(detections):
+                if idx in excluded:
+                    continue
+                x, y = center(det)
+                distance = _dist(track.bottom_center_x, track.bottom_center_y, x, y)
+                if distance < best_dist:
+                    best_idx = idx
+                    best_dist = distance
+            if best_dist > max_match_distance:
+                return None, best_dist
+            return best_idx, best_dist
 
-        pa_bc = (state.player_a.bottom_center_x, state.player_a.bottom_center_y)
-        pb_bc = (state.player_b.bottom_center_x, state.player_b.bottom_center_y)
+        # When both tracks exist, choose the non-overlapping assignment with
+        # the lowest total movement. This is less swap-prone than greedily
+        # pairing the two highest-confidence boxes.
+        if state.player_a is not None and state.player_b is not None:
+            best_pair: tuple[Optional[int], Optional[int]] = (None, None)
+            best_total = float("inf")
+            for a_idx, a_det in enumerate(detections):
+                ax, ay = center(a_det)
+                dist_a = _dist(
+                    state.player_a.bottom_center_x,
+                    state.player_a.bottom_center_y,
+                    ax,
+                    ay,
+                )
+                if dist_a > max_match_distance:
+                    continue
+                for b_idx, b_det in enumerate(detections):
+                    if b_idx == a_idx:
+                        continue
+                    bx, by = center(b_det)
+                    dist_b = _dist(
+                        state.player_b.bottom_center_x,
+                        state.player_b.bottom_center_y,
+                        bx,
+                        by,
+                    )
+                    if dist_b > max_match_distance:
+                        continue
+                    total = dist_a + dist_b
+                    if total < best_total:
+                        best_pair = (a_idx, b_idx)
+                        best_total = total
 
-        da_bc = (d_a.bbox.bottom_center.x, d_a.bbox.bottom_center.y)
-        db_bc = (d_b.bbox.bottom_center.x, d_b.bbox.bottom_center.y)
+            a_idx, b_idx = best_pair
+            return (
+                detections[a_idx] if a_idx is not None else None,
+                detections[b_idx] if b_idx is not None else None,
+            )
 
-        # Compute all 4 distances
-        a_a = _dist(pa_bc[0], pa_bc[1], da_bc[0], da_bc[1])
-        a_b = _dist(pa_bc[0], pa_bc[1], db_bc[0], db_bc[1])
-        b_a = _dist(pb_bc[0], pb_bc[1], da_bc[0], da_bc[1])
-        b_b = _dist(pb_bc[0], pb_bc[1], db_bc[0], db_bc[1])
-
-        # Greedy: assign the closest pair first
-        if a_a + b_b <= a_b + b_a:
-            return (d_a, d_b)
-        else:
-            return (d_b, d_a)
+        a_idx, _ = best_for_track(state.player_a, set())
+        b_idx, _ = best_for_track(state.player_b, {a_idx} if a_idx is not None else set())
+        return (
+            detections[a_idx] if a_idx is not None else None,
+            detections[b_idx] if b_idx is not None else None,
+        )
 
 
 # ── Frame tracking convenience ─────────────────────────────────────────
