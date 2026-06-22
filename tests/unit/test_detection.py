@@ -331,9 +331,10 @@ class TestCourtKeypointDetector:
         keypoints = detector.predict(dummy_image, conf_threshold=0.0)
 
         assert len(keypoints) == 15
-        assert keypoints[0].label == "doubles_near_left"
-        assert keypoints[4].label == "doubles_far_right"
-        assert keypoints[7].label == "doubles_far_left"
+        assert keypoints[0].label == "doubles_far_left"
+        assert keypoints[1].label == "doubles_far_right"
+        assert keypoints[2].label == "doubles_near_left"
+        assert keypoints[3].label == "doubles_near_right"
         assert keypoints[14].label == "net_center"
         assert [kp.label for kp in keypoints] == [
             ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS[i] for i in range(15)

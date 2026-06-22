@@ -22,20 +22,25 @@ COCO_PERSON_CLASS_ID: int = 0
 """COCO class ID for ``person``."""
 
 ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS: dict[int, str] = {
-    0: "doubles_near_left",
-    1: "singles_near_left",
-    2: "singles_near_right",
+    # The Roboflow tennis-court-suuzy dataset follows the common mini-court
+    # order used by open-source tennis trackers: full-court corners, singles
+    # corners, service-box corners, service-line centers, then net center.
+    # In our court coordinate convention, panel top is the far baseline and
+    # panel bottom is the near baseline.
+    0: "doubles_far_left",
+    1: "doubles_far_right",
+    2: "doubles_near_left",
     3: "doubles_near_right",
-    4: "doubles_far_right",
-    5: "singles_far_right",
-    6: "singles_far_left",
-    7: "doubles_far_left",
+    4: "singles_far_left",
+    5: "singles_near_left",
+    6: "singles_far_right",
+    7: "singles_near_right",
     8: "service_far_left",
-    9: "service_far_center",
-    10: "service_far_right",
+    9: "service_far_right",
+    10: "service_near_left",
     11: "service_near_right",
-    12: "service_near_center",
-    13: "service_near_left",
+    12: "service_far_center",
+    13: "service_near_center",
     14: "net_center",
 }
 """Default index→geometry labels for Roboflow abiya-thesis/tennis-court-suuzy."""
