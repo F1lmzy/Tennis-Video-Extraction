@@ -45,6 +45,21 @@ def _ball(
     )
 
 
+def _ball_box(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    confidence: float = 0.9,
+) -> BallDetection:
+    bbox = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2)
+    return BallDetection(
+        bbox=bbox,
+        center=bbox.center,
+        confidence=confidence,
+    )
+
+
 # ── PlayerTracker tests ────────────────────────────────────────────────
 
 
@@ -339,3 +354,36 @@ class TestSelectBestBall:
         )
 
         assert best is near_previous_track
+
+    def test_static_court_line_near_previous_ball_does_not_keep_track(self) -> None:
+        previous = np.zeros((120, 120, 3), dtype=np.uint8)
+        current = previous.copy()
+
+        # A static line-like false positive is present in both frames and is
+        # close to the previous selected location.
+        previous[48:52, 35:65] = 255
+        current[48:52, 35:65] = 255
+
+        # The actual ball has lower confidence, but it changes the frame.
+        current[78:83, 78:83] = 255
+
+        static_line = _ball_box(35, 48, 65, 52, confidence=0.92)
+        moving_ball = _ball(80, 80, confidence=0.28)
+        previous_ball = _ball(50, 50, confidence=0.9)
+
+        best = select_best_ball(
+            [static_line, moving_ball],
+            previous_frame=previous,
+            current_frame=current,
+            previous_ball=previous_ball,
+        )
+
+        assert best is moving_ball
+
+    def test_elongated_box_is_penalized_without_motion_context(self) -> None:
+        line_fragment = _ball_box(10, 20, 50, 24, confidence=0.91)
+        rounder_ball = _ball(80, 80, confidence=0.75)
+
+        best = select_best_ball([line_fragment, rounder_ball])
+
+        assert best is rounder_ball

@@ -279,15 +279,28 @@ def _center_distance(a: BallDetection, b: BallDetection) -> float:
     return _dist(a.center.x, a.center.y, b.center.x, b.center.y)
 
 
+def _ball_shape_penalty(detection: BallDetection) -> float:
+    """Penalty for boxes that look more like line segments than balls."""
+    width = max(detection.bbox.width, 1e-6)
+    height = max(detection.bbox.height, 1e-6)
+    aspect_ratio = max(width / height, height / width)
+    if aspect_ratio <= 2.0:
+        return 0.0
+    return min((aspect_ratio - 2.0) / 3.0, 1.0)
+
+
 def select_best_ball(
     detections: list[BallDetection],
     *,
     previous_frame: Optional[np.ndarray] = None,
     current_frame: Optional[np.ndarray] = None,
     previous_ball: Optional[BallDetection] = None,
-    motion_weight: float = 1.0,
+    motion_weight: float = 1.25,
     proximity_weight: float = 0.35,
     max_proximity_px: float = 180.0,
+    min_motion_score: float = 1.0,
+    static_penalty: float = 0.75,
+    shape_weight: float = 0.35,
 ) -> Optional[BallDetection]:
     """Return the most plausible ball detection, or ``None``.
 
@@ -300,16 +313,33 @@ def select_best_ball(
         return None
 
     if previous_frame is None or current_frame is None:
-        return max(detections, key=lambda d: d.confidence)
+        return max(
+            detections,
+            key=lambda d: d.confidence - shape_weight * _ball_shape_penalty(d),
+        )
+
+    motion_by_detection = {
+        det: _bbox_motion_score(det, previous_frame, current_frame)
+        for det in detections
+    }
+    moving_detections = [
+        det for det, motion_score in motion_by_detection.items()
+        if motion_score >= min_motion_score
+    ]
+    candidates = moving_detections or detections
 
     def score(det: BallDetection) -> float:
+        motion_score = motion_by_detection[det]
         # Normalize typical 8-bit frame differences into roughly [0, 1].
-        motion = min(_bbox_motion_score(det, previous_frame, current_frame) / 25.0, 1.0)
+        motion = min(motion_score / 25.0, 1.0)
         total = det.confidence + motion_weight * motion
-        if previous_ball is not None:
+        if motion_score < min_motion_score:
+            total -= static_penalty
+        total -= shape_weight * _ball_shape_penalty(det)
+        if previous_ball is not None and motion_score >= min_motion_score:
             distance = _center_distance(det, previous_ball)
             proximity = max(0.0, 1.0 - distance / max_proximity_px)
             total += proximity_weight * proximity
         return total
 
-    return max(detections, key=score)
+    return max(candidates, key=score)
