@@ -14,6 +14,7 @@ from tennis_tracker.render import (
     render_annotated_video,
     _draw_court_panel,
     _draw_source_overlay,
+    _scale_row_pixels,
 )
 from tennis_tracker.types import OutputRow
 from tennis_tracker.video import write_video, read_video_metadata
@@ -280,6 +281,23 @@ class TestDrawSourceOverlay:
 
 
 # ─── Annotated frame generation ────────────────────────────────────────
+
+
+class TestScaleRowPixels:
+    def test_scales_source_pixel_fields_only(self) -> None:
+        row = _make_output_row()
+
+        scaled = _scale_row_pixels(row, 0.5)
+
+        assert scaled.player_a_pixel_x == pytest.approx(100.0)
+        assert scaled.player_a_pixel_y == pytest.approx(75.0)
+        assert scaled.player_b_pixel_x == pytest.approx(200.0)
+        assert scaled.player_b_pixel_y == pytest.approx(150.0)
+        assert scaled.ball_pixel_x == pytest.approx(150.0)
+        assert scaled.ball_pixel_y == pytest.approx(100.0)
+        assert scaled.ball_x_m == row.ball_x_m
+        assert scaled.ball_y_m == row.ball_y_m
+        assert row.ball_pixel_x == pytest.approx(300.0)
 
 
 class TestRenderAnnotatedFrames:

@@ -362,6 +362,11 @@ def run_process(
     fps: Optional[float] = None,
     smoothing_max_gap: int = 5,
     homography_every_frame: bool = False,
+    player_conf: float = 0.25,
+    ball_conf: float = 0.05,
+    court_conf: float = 0.25,
+    imgsz: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> dict:
     """Run the real (or mocked) detection-based process pipeline.
 
@@ -447,7 +452,12 @@ def run_process(
         if court_detector is not None and (
             not first_frame_processed or homography_every_frame
         ):
-            court_keypoints = court_detector.predict(frame_bgr)
+            court_keypoints = court_detector.predict(
+                frame_bgr,
+                conf_threshold=court_conf,
+                imgsz=imgsz,
+                device=device,
+            )
             if len(court_keypoints) >= 4:
                 from tennis_tracker.court import named_point_by_label
 
@@ -471,12 +481,22 @@ def run_process(
         # ── Player detection and tracking ──
         player_dets: list = []
         if player_detector is not None:
-            player_dets = player_detector.predict(frame_bgr)
+            player_dets = player_detector.predict(
+                frame_bgr,
+                conf_threshold=player_conf,
+                imgsz=imgsz,
+                device=device,
+            )
 
         # ── Ball detection ──
         ball_dets: list = []
         if ball_detector is not None:
-            ball_dets = ball_detector.predict(frame_bgr)
+            ball_dets = ball_detector.predict(
+                frame_bgr,
+                conf_threshold=ball_conf,
+                imgsz=imgsz,
+                device=device,
+            )
         best_ball = select_best_ball(
             ball_dets,
             previous_frame=previous_frame_bgr,

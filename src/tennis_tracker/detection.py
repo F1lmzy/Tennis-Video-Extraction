@@ -131,6 +131,8 @@ class PlayerDetector:
         self,
         image: np.ndarray,
         conf_threshold: float = 0.25,
+        imgsz: Optional[int] = None,
+        device: Optional[str] = None,
     ) -> list[PlayerDetection]:
         """Run inference and return person detections.
 
@@ -147,7 +149,12 @@ class PlayerDetector:
             Detections filtered to the COCO ``person`` class, sorted by
             decreasing confidence.
         """
-        results = self._model.predict(image, conf=conf_threshold, verbose=False)
+        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        if imgsz is not None:
+            predict_kwargs["imgsz"] = imgsz
+        if device is not None:
+            predict_kwargs["device"] = device
+        results = self._model.predict(image, **predict_kwargs)
         if not results:
             return []
 
@@ -220,6 +227,8 @@ class BallDetector:
         self,
         image: np.ndarray,
         conf_threshold: float = 0.25,
+        imgsz: Optional[int] = None,
+        device: Optional[str] = None,
     ) -> list[BallDetection]:
         """Run inference and return ball detections.
 
@@ -237,7 +246,12 @@ class BallDetector:
             ball detection, so no class filtering is applied), sorted by
             decreasing confidence.
         """
-        results = self._model.predict(image, conf=conf_threshold, verbose=False)
+        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        if imgsz is not None:
+            predict_kwargs["imgsz"] = imgsz
+        if device is not None:
+            predict_kwargs["device"] = device
+        results = self._model.predict(image, **predict_kwargs)
         if not results:
             return []
 
@@ -312,6 +326,8 @@ class CourtKeypointDetector:
         self,
         image: np.ndarray,
         conf_threshold: float = 0.25,
+        imgsz: Optional[int] = None,
+        device: Optional[str] = None,
     ) -> list[CourtKeypoint]:
         """Run inference and return detected court keypoints.
 
@@ -331,7 +347,12 @@ class CourtKeypointDetector:
             dominant instance).  Keypoints with zero coordinates (a
             Ultralytics convention for undetected keypoints) are omitted.
         """
-        results = self._model.predict(image, conf=conf_threshold, verbose=False)
+        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        if imgsz is not None:
+            predict_kwargs["imgsz"] = imgsz
+        if device is not None:
+            predict_kwargs["device"] = device
+        results = self._model.predict(image, **predict_kwargs)
         if not results:
             return []
 

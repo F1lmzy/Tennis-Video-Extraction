@@ -51,6 +51,30 @@ def main() -> None:
         default=True,
         help="Resize source frame to make room for 2D court panel",
     )
+    process_parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=None,
+        help="YOLO inference image size. Use 1280 for small ball detection.",
+    )
+    process_parser.add_argument(
+        "--player-conf",
+        type=float,
+        default=0.25,
+        help="Player detection confidence threshold",
+    )
+    process_parser.add_argument(
+        "--ball-conf",
+        type=float,
+        default=0.05,
+        help="Ball detection confidence threshold",
+    )
+    process_parser.add_argument(
+        "--court-conf",
+        type=float,
+        default=0.25,
+        help="Court keypoint detection confidence threshold",
+    )
 
     # --- train-ball ---
     train_ball_parser = subparsers.add_parser(
@@ -166,6 +190,11 @@ def _handle_process(args: argparse.Namespace) -> None:
         ball_model_path=args.ball_model,
         court_model_path=args.court_model,
         fps=args.target_fps,
+        player_conf=args.player_conf,
+        ball_conf=args.ball_conf,
+        court_conf=args.court_conf,
+        imgsz=args.imgsz,
+        device=args.device,
     )
 
     print(f"  Processed {summary['raw_row_count']} frames")

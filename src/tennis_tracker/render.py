@@ -9,7 +9,7 @@ Produces annotated frames containing:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -308,6 +308,27 @@ def _draw_source_overlay(
             y_offset -= 18
 
 
+def _scale_row_pixels(row: OutputRow, scale: float) -> OutputRow:
+    """Return a copy of *row* with source-frame pixel coordinates scaled.
+
+    CSV rows store coordinates in the original video frame.  The renderer
+    resizes the source frame before drawing, so source overlay coordinates
+    must be scaled to stay aligned with the resized image.
+    """
+    def scaled(value: Optional[float]) -> Optional[float]:
+        return value * scale if value is not None else None
+
+    return replace(
+        row,
+        player_a_pixel_x=scaled(row.player_a_pixel_x),
+        player_a_pixel_y=scaled(row.player_a_pixel_y),
+        player_b_pixel_x=scaled(row.player_b_pixel_x),
+        player_b_pixel_y=scaled(row.player_b_pixel_y),
+        ball_pixel_x=scaled(row.ball_pixel_x),
+        ball_pixel_y=scaled(row.ball_pixel_y),
+    )
+
+
 # ── Main rendering function ───────────────────────────────────────────
 
 
@@ -371,8 +392,13 @@ def render_annotated_frames(
         resized = cv2.resize(frame_bgr, (new_w, target_height))
 
         # ── Get the output row for this frame ──
-        output_row: Optional[OutputRow] = (
+        raw_output_row: Optional[OutputRow] = (
             output_rows[idx] if idx < total_rows else None
+        )
+        output_row = (
+            _scale_row_pixels(raw_output_row, scale_h)
+            if raw_output_row is not None
+            else None
         )
 
         # ── Update ball trail ──
