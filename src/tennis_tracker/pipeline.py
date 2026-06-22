@@ -370,6 +370,9 @@ def run_process(
     ball_motion_threshold: float = 5.0,
     ball_max_jump_px: float = 180.0,
     ball_min_initial_displacement_px: float = 2.0,
+    flip_court_x: bool = False,
+    flip_court_y: bool = False,
+    ball_projection_anchor: str = "bottom_center",
 ) -> dict:
     """Run the real (or mocked) detection-based process pipeline.
 
@@ -541,20 +544,22 @@ def run_process(
         tracked = tracker.update(player_dets, ball=best_ball)
 
         # ── Project to court coordinates ──
-        def _project(det, use_bottom_center: bool = True) -> Optional[dict]:
+        def _project(det, anchor: str = "bottom_center") -> Optional[dict]:
             """Project a detection pixel to court meter coordinates."""
             if det is None or homography_matrix is None:
                 return None
-            pixel = det.bbox.bottom_center if use_bottom_center else det.bbox.center
+            pixel = det.bbox.center if anchor == "center" else det.bbox.bottom_center
             try:
                 cp = project_pixel_to_court(pixel, homography_matrix, det.confidence)
-                return {"x_m": cp.x_m, "y_m": cp.y_m, "conf": cp.confidence}
+                x_m = -cp.x_m if flip_court_x else cp.x_m
+                y_m = -cp.y_m if flip_court_y else cp.y_m
+                return {"x_m": x_m, "y_m": y_m, "conf": cp.confidence}
             except ValueError:
                 return None
 
         pa_proj = _project(tracked.player_a)
         pb_proj = _project(tracked.player_b)
-        ball_proj = _project(best_ball, use_bottom_center=False) if best_ball else None
+        ball_proj = _project(best_ball, anchor=ball_projection_anchor) if best_ball else None
 
         # ── Build diagnostics ──
         diag = Diagnostics()

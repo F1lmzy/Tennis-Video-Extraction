@@ -93,6 +93,22 @@ def main() -> None:
         default=2.0,
         help="Minimum movement needed to confirm initial ball acquisition",
     )
+    process_parser.add_argument(
+        "--flip-court-x",
+        action="store_true",
+        help="Flip projected court X coordinates if the top view is horizontally mirrored",
+    )
+    process_parser.add_argument(
+        "--flip-court-y",
+        action="store_true",
+        help="Flip projected court Y coordinates if near/far court direction is reversed",
+    )
+    process_parser.add_argument(
+        "--ball-projection-anchor",
+        choices=["center", "bottom_center"],
+        default="bottom_center",
+        help="Ball bbox point used for court-plane projection",
+    )
 
     # --- train-ball ---
     train_ball_parser = subparsers.add_parser(
@@ -216,6 +232,9 @@ def _handle_process(args: argparse.Namespace) -> None:
         ball_motion_threshold=args.ball_motion_threshold,
         ball_max_jump_px=args.ball_max_jump_px,
         ball_min_initial_displacement_px=args.ball_min_initial_displacement_px,
+        flip_court_x=args.flip_court_x,
+        flip_court_y=args.flip_court_y,
+        ball_projection_anchor=args.ball_projection_anchor,
     )
 
     print(f"  Processed {summary['raw_row_count']} frames")
