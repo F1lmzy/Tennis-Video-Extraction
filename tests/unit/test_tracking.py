@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from tennis_tracker.detection import BallDetection, BoundingBox, PlayerDetection
-from tennis_tracker.tracking import PlayerTracker, select_best_ball
+from tennis_tracker.tracking import PlayerTracker, has_local_ball_motion, select_best_ball
 from tennis_tracker.types import PixelPoint
 
 
@@ -387,3 +387,36 @@ class TestSelectBestBall:
         best = select_best_ball([line_fragment, rounder_ball])
 
         assert best is rounder_ball
+
+    def test_prefers_near_previous_moving_ball_over_far_moving_false_positive(self) -> None:
+        previous = np.zeros((160, 160, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[58:63, 58:63] = 255
+        current[138:143, 138:143] = 255
+
+        near_previous_track = _ball(60, 60, confidence=0.45)
+        far_false_positive = _ball(140, 140, confidence=0.9)
+        previous_ball = _ball(55, 58, confidence=0.8)
+
+        best = select_best_ball(
+            [far_false_positive, near_previous_track],
+            previous_frame=previous,
+            current_frame=current,
+            previous_ball=previous_ball,
+            max_proximity_px=40,
+        )
+
+        assert best is near_previous_track
+
+    def test_has_local_ball_motion_rejects_static_candidate(self) -> None:
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = previous.copy()
+        previous[18:23, 18:23] = 255
+        current[18:23, 18:23] = 255
+        current[58:63, 58:63] = 255
+
+        static_line = _ball(20, 20, confidence=0.9)
+        moving_ball = _ball(60, 60, confidence=0.4)
+
+        assert not has_local_ball_motion(static_line, previous, current)
+        assert has_local_ball_motion(moving_ball, previous, current)

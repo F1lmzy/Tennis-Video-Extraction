@@ -413,7 +413,11 @@ def run_process(
     ``homography_valid``, and ``diagnostics_summary``.
     """
     # ── Late imports to avoid circular dependency at module level ──
-    from tennis_tracker.tracking import PlayerTracker, select_best_ball
+    from tennis_tracker.tracking import (
+        PlayerTracker,
+        has_local_ball_motion,
+        select_best_ball,
+    )
 
     # ── Resolve video metadata ──
     if fps is None:
@@ -562,9 +566,13 @@ def run_process(
             diagnostics=diag.to_string(),
         )
         raw_rows.append(row)
-        previous_frame_bgr = frame_bgr.copy()
-        if best_ball is not None:
+        if best_ball is not None and has_local_ball_motion(
+            best_ball,
+            previous_frame_bgr,
+            frame_bgr,
+        ):
             previous_ball = best_ball
+        previous_frame_bgr = frame_bgr.copy()
 
     # ── Write raw CSV ──
     raw_csv_path = Path(raw_csv_path)

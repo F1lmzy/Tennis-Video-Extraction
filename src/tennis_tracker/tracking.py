@@ -279,6 +279,19 @@ def _center_distance(a: BallDetection, b: BallDetection) -> float:
     return _dist(a.center.x, a.center.y, b.center.x, b.center.y)
 
 
+def has_local_ball_motion(
+    detection: BallDetection,
+    previous_frame: Optional[np.ndarray],
+    current_frame: Optional[np.ndarray],
+    *,
+    min_motion_score: float = 1.0,
+) -> bool:
+    """Return True when a ball candidate changes locally between frames."""
+    if previous_frame is None or current_frame is None:
+        return True
+    return _bbox_motion_score(detection, previous_frame, current_frame) >= min_motion_score
+
+
 def _ball_shape_penalty(detection: BallDetection) -> float:
     """Penalty for boxes that look more like line segments than balls."""
     width = max(detection.bbox.width, 1e-6)
@@ -326,7 +339,18 @@ def select_best_ball(
         det for det, motion_score in motion_by_detection.items()
         if motion_score >= min_motion_score
     ]
-    candidates = moving_detections or detections
+
+    if previous_ball is not None:
+        near_moving_detections = [
+            det for det in moving_detections
+            if _center_distance(det, previous_ball) <= max_proximity_px
+        ]
+        # Prefer a moving candidate that is close to the previous confirmed
+        # ball location.  This prevents jumping to unrelated white court-line
+        # fragments elsewhere in the frame.
+        candidates = near_moving_detections or moving_detections or detections
+    else:
+        candidates = moving_detections or detections
 
     def score(det: BallDetection) -> float:
         motion_score = motion_by_detection[det]
