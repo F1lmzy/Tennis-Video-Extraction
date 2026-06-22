@@ -20,6 +20,7 @@ from tennis_tracker.court import (
     DOUBLES_LENGTH,
     DOUBLES_WIDTH,
     SERVICE_LINE_DISTANCE,
+    SINGLES_WIDTH,
 )
 from tennis_tracker.types import OutputRow
 from tennis_tracker.video import iter_frames, read_video_metadata, write_video
@@ -60,13 +61,14 @@ def _court_to_panel(
     y_m: float,
     panel_width: int,
     panel_height: int,
+    court_width_m: float = DOUBLES_WIDTH,
 ) -> tuple[int, int]:
     """Convert court-meter coordinates to panel pixel coordinates.
 
     The panel Y-axis is inverted so that +Y (far baseline) goes upward,
     matching typical top-down orientation.
     """
-    scale_x = panel_width / DOUBLES_WIDTH
+    scale_x = panel_width / court_width_m
     scale_y = panel_height / DOUBLES_LENGTH
     # Use a uniform scale to preserve aspect ratio
     scale = min(scale_x, scale_y)
@@ -87,51 +89,62 @@ def _draw_court_panel(
     ball_trail_meters: list[tuple[float, float]],
     panel_width: int,
     panel_height: int,
+    court_view: str = "doubles",
 ) -> None:
     """Draw court lines and player/ball markers on the top-view panel.
 
     Mutates *panel* in place.
     """
     # ── Helper to convert court meter → panel pixel ──
-    def _p(x_m: float, y_m: float) -> tuple[int, int]:
-        return _court_to_panel(x_m, y_m, panel_width, panel_height)
+    active_width = SINGLES_WIDTH if court_view == "singles" else DOUBLES_WIDTH
+    active_half = active_width / 2.0
+    singles_half = SINGLES_WIDTH / 2.0
 
-    # ── Court area fill ──
+    def _p(x_m: float, y_m: float) -> tuple[int, int]:
+        return _court_to_panel(
+            x_m,
+            y_m,
+            panel_width,
+            panel_height,
+            court_width_m=active_width,
+        )
+
+    # ── Active court area fill ──
     cv2.rectangle(
         panel,
-        _p(-DOUBLES_WIDTH / 2, -DOUBLES_LENGTH / 2),
-        _p(DOUBLES_WIDTH / 2, DOUBLES_LENGTH / 2),
+        _p(-active_half, -DOUBLES_LENGTH / 2),
+        _p(active_half, DOUBLES_LENGTH / 2),
         _COLOR_COURT_FILL,
         -1,
     )
 
-    # ── Doubles outline ──
-    near_left = _p(-DOUBLES_WIDTH / 2, -DOUBLES_LENGTH / 2)
-    far_right = _p(DOUBLES_WIDTH / 2, DOUBLES_LENGTH / 2)
+    # ── Active outline ──
+    near_left = _p(-active_half, -DOUBLES_LENGTH / 2)
+    far_right = _p(active_half, DOUBLES_LENGTH / 2)
     cv2.rectangle(panel, near_left, far_right, _COLOR_COURT_LINE, 1)
 
-    # ── Singles sidelines ──
-    singles_half = 4.115  # SINGLES_WIDTH / 2
-    cv2.line(
-        panel,
-        _p(-singles_half, -DOUBLES_LENGTH / 2),
-        _p(-singles_half, DOUBLES_LENGTH / 2),
-        _COLOR_COURT_LINE,
-        1,
-    )
-    cv2.line(
-        panel,
-        _p(singles_half, -DOUBLES_LENGTH / 2),
-        _p(singles_half, DOUBLES_LENGTH / 2),
-        _COLOR_COURT_LINE,
-        1,
-    )
+    # ── Singles sidelines when the full doubles court is displayed ──
+    if court_view != "singles":
+        cv2.line(
+            panel,
+            _p(-singles_half, -DOUBLES_LENGTH / 2),
+            _p(-singles_half, DOUBLES_LENGTH / 2),
+            _COLOR_COURT_LINE,
+            1,
+        )
+        cv2.line(
+            panel,
+            _p(singles_half, -DOUBLES_LENGTH / 2),
+            _p(singles_half, DOUBLES_LENGTH / 2),
+            _COLOR_COURT_LINE,
+            1,
+        )
 
     # ── Net ──
     cv2.line(
         panel,
-        _p(-DOUBLES_WIDTH / 2, 0),
-        _p(DOUBLES_WIDTH / 2, 0),
+        _p(-active_half, 0),
+        _p(active_half, 0),
         _COLOR_NET,
         2,
     )
@@ -349,6 +362,7 @@ def render_annotated_frames(
     target_height: int = _DEFAULT_TARGET_HEIGHT,
     panel_width: int = _DEFAULT_PANEL_WIDTH,
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
+    court_view: str = "doubles",
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield annotated frames from a video and tracking output rows.
 
@@ -371,6 +385,9 @@ def render_annotated_frames(
         Width of the top-view court panel in pixels.
     ball_trail_length:
         Number of recent ball positions to draw as a fading trail.
+    court_view:
+        ``"singles"`` draws/scales the active singles court. ``"doubles"``
+        draws/scales the full doubles court.
 
     Yields
     ------
@@ -434,6 +451,7 @@ def render_annotated_frames(
             ball_trail_meters=ball_trail_meters,
             panel_width=panel_width,
             panel_height=target_height,
+            court_view=court_view,
         )
 
         # ── Combine ──
@@ -451,6 +469,7 @@ def render_annotated_video(
     panel_width: int = _DEFAULT_PANEL_WIDTH,
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
     fps: Optional[float] = None,
+    court_view: str = "doubles",
 ) -> AnnotatedVideoResult:
     """Render an annotated video file from source + tracking data.
 
@@ -473,6 +492,9 @@ def render_annotated_video(
         Trail length for ball markers.
     fps:
         Output video FPS.  If None, reads from source video metadata.
+    court_view:
+        ``"singles"`` draws/scales the active singles court. ``"doubles"``
+        draws/scales the full doubles court.
 
     Returns
     -------
@@ -494,6 +516,7 @@ def render_annotated_video(
         target_height=target_height,
         panel_width=panel_width,
         ball_trail_length=ball_trail_length,
+        court_view=court_view,
     ):
         frames.append(annotated)
 

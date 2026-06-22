@@ -109,6 +109,12 @@ def main() -> None:
         default="bottom_center",
         help="Ball bbox point used for court-plane projection",
     )
+    process_parser.add_argument(
+        "--top-view-court",
+        choices=["singles", "doubles"],
+        default="singles",
+        help="Court width used by the side 2D top-view panel",
+    )
 
     # --- train-ball ---
     train_ball_parser = subparsers.add_parser(
@@ -235,6 +241,7 @@ def _handle_process(args: argparse.Namespace) -> None:
         flip_court_x=args.flip_court_x,
         flip_court_y=args.flip_court_y,
         ball_projection_anchor=args.ball_projection_anchor,
+        top_view_court=args.top_view_court,
     )
 
     print(f"  Processed {summary['raw_row_count']} frames")

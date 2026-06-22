@@ -373,6 +373,7 @@ def run_process(
     flip_court_x: bool = False,
     flip_court_y: bool = False,
     ball_projection_anchor: str = "bottom_center",
+    top_view_court: str = "singles",
 ) -> dict:
     """Run the real (or mocked) detection-based process pipeline.
 
@@ -630,6 +631,7 @@ def run_process(
             smoothed_rows,
             video_output_path,
             fps=fps,
+            court_view=top_view_court,
         )
 
     # ── Summary diagnostics ──
