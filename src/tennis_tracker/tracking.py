@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
+
 from tennis_tracker.detection import BallDetection, PlayerDetection
 from tennis_tracker.diagnostics import Diagnostics
 
@@ -245,19 +247,69 @@ class PlayerTracker:
 
 # ── Frame tracking convenience ─────────────────────────────────────────
 
-def select_best_ball(detections: list[BallDetection]) -> Optional[BallDetection]:
-    """Return the highest-confidence ball detection, or ``None``.
+def _bbox_motion_score(
+    detection: BallDetection,
+    previous_frame: np.ndarray,
+    current_frame: np.ndarray,
+    padding: int = 4,
+) -> float:
+    """Mean absolute pixel difference around a candidate ball box.
 
-    Parameters
-    ----------
-    detections:
-        Raw ball detections for this frame, in any order.
+    Static white court artifacts tend to look nearly identical between
+    consecutive fixed-camera frames.  A real tennis ball usually changes
+    the local patch from the previous frame, so this score is useful for
+    rejecting static false positives.
+    """
+    height, width = current_frame.shape[:2]
+    x1 = max(0, int(detection.bbox.x1) - padding)
+    y1 = max(0, int(detection.bbox.y1) - padding)
+    x2 = min(width, int(detection.bbox.x2) + padding)
+    y2 = min(height, int(detection.bbox.y2) + padding)
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
 
-    Returns
-    -------
-    The detection with the highest confidence, or ``None`` if the list
-    is empty.
+    prev_patch = previous_frame[y1:y2, x1:x2].astype(np.float32)
+    curr_patch = current_frame[y1:y2, x1:x2].astype(np.float32)
+    if prev_patch.shape != curr_patch.shape or prev_patch.size == 0:
+        return 0.0
+    return float(np.mean(np.abs(curr_patch - prev_patch)))
+
+
+def _center_distance(a: BallDetection, b: BallDetection) -> float:
+    return _dist(a.center.x, a.center.y, b.center.x, b.center.y)
+
+
+def select_best_ball(
+    detections: list[BallDetection],
+    *,
+    previous_frame: Optional[np.ndarray] = None,
+    current_frame: Optional[np.ndarray] = None,
+    previous_ball: Optional[BallDetection] = None,
+    motion_weight: float = 1.0,
+    proximity_weight: float = 0.35,
+    max_proximity_px: float = 180.0,
+) -> Optional[BallDetection]:
+    """Return the most plausible ball detection, or ``None``.
+
+    With only detections, this preserves the original behaviour and selects
+    the highest-confidence box.  When consecutive frames are supplied, the
+    score also rewards local pixel motion, which suppresses fixed white court
+    artifacts that a ball detector may repeatedly classify as balls.
     """
     if not detections:
         return None
-    return max(detections, key=lambda d: d.confidence)
+
+    if previous_frame is None or current_frame is None:
+        return max(detections, key=lambda d: d.confidence)
+
+    def score(det: BallDetection) -> float:
+        # Normalize typical 8-bit frame differences into roughly [0, 1].
+        motion = min(_bbox_motion_score(det, previous_frame, current_frame) / 25.0, 1.0)
+        total = det.confidence + motion_weight * motion
+        if previous_ball is not None:
+            distance = _center_distance(det, previous_ball)
+            proximity = max(0.0, 1.0 - distance / max_proximity_px)
+            total += proximity_weight * proximity
+        return total
+
+    return max(detections, key=score)

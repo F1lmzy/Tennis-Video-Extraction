@@ -436,6 +436,8 @@ def run_process(
     homography_valid = False
     court_confidence: Optional[float] = None
     first_frame_processed = False
+    previous_frame_bgr: Optional[np.ndarray] = None
+    previous_ball = None
 
     # ── Process each frame ──
     for idx, (frame_index, frame_bgr) in enumerate(iter_frames(video_path)):
@@ -475,7 +477,12 @@ def run_process(
         ball_dets: list = []
         if ball_detector is not None:
             ball_dets = ball_detector.predict(frame_bgr)
-        best_ball = select_best_ball(ball_dets) if ball_dets else None
+        best_ball = select_best_ball(
+            ball_dets,
+            previous_frame=previous_frame_bgr,
+            current_frame=frame_bgr,
+            previous_ball=previous_ball,
+        ) if ball_dets else None
 
         # ── Track players ──
         tracked = tracker.update(player_dets, ball=best_ball)
@@ -535,6 +542,9 @@ def run_process(
             diagnostics=diag.to_string(),
         )
         raw_rows.append(row)
+        previous_frame_bgr = frame_bgr.copy()
+        if best_ball is not None:
+            previous_ball = best_ball
 
     # ── Write raw CSV ──
     raw_csv_path = Path(raw_csv_path)

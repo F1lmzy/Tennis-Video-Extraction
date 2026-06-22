@@ -6,6 +6,7 @@ All tests use fake ``PlayerDetection`` and ``BallDetection`` objects
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from tennis_tracker.detection import BallDetection, BoundingBox, PlayerDetection
@@ -297,3 +298,44 @@ class TestSelectBestBall:
         best = select_best_ball([_ball(10, 10, confidence=0.8)])
         assert best is not None
         assert best.confidence == 0.8
+
+    def test_motion_score_prefers_moving_ball_over_static_false_positive(self) -> None:
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = previous.copy()
+
+        # Static white court artifact appears in both frames.
+        previous[18:23, 18:23] = 255
+        current[18:23, 18:23] = 255
+
+        # Real moving ball appears only in the current frame.
+        current[58:63, 58:63] = 255
+
+        static_false_positive = _ball(20, 20, confidence=0.95)
+        moving_ball = _ball(60, 60, confidence=0.35)
+
+        best = select_best_ball(
+            [static_false_positive, moving_ball],
+            previous_frame=previous,
+            current_frame=current,
+        )
+
+        assert best is moving_ball
+
+    def test_previous_ball_proximity_breaks_motion_ties(self) -> None:
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[28:33, 28:33] = 255
+        current[78:83, 78:83] = 255
+
+        near_previous_track = _ball(30, 30, confidence=0.5)
+        far_from_track = _ball(80, 80, confidence=0.5)
+        previous_ball = _ball(28, 28, confidence=0.7)
+
+        best = select_best_ball(
+            [far_from_track, near_previous_track],
+            previous_frame=previous,
+            current_frame=current,
+            previous_ball=previous_ball,
+        )
+
+        assert best is near_previous_track
