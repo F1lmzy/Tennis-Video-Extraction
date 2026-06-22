@@ -367,6 +367,9 @@ def run_process(
     court_conf: float = 0.25,
     imgsz: Optional[int] = None,
     device: Optional[str] = None,
+    ball_motion_threshold: float = 5.0,
+    ball_max_jump_px: float = 180.0,
+    ball_min_initial_displacement_px: float = 2.0,
 ) -> dict:
     """Run the real (or mocked) detection-based process pipeline.
 
@@ -415,6 +418,7 @@ def run_process(
     # ── Late imports to avoid circular dependency at module level ──
     from tennis_tracker.tracking import (
         PlayerTracker,
+        ball_center_distance,
         has_local_ball_motion,
         select_best_ball,
     )
@@ -447,6 +451,7 @@ def run_process(
     first_frame_processed = False
     previous_frame_bgr: Optional[np.ndarray] = None
     previous_ball = None
+    pending_ball = None
 
     # ── Process each frame ──
     for idx, (frame_index, frame_bgr) in enumerate(iter_frames(video_path)):
@@ -501,12 +506,36 @@ def run_process(
                 imgsz=imgsz,
                 device=device,
             )
-        best_ball = select_best_ball(
+        ball_candidate = select_best_ball(
             ball_dets,
             previous_frame=previous_frame_bgr,
             current_frame=frame_bgr,
             previous_ball=previous_ball,
+            max_proximity_px=ball_max_jump_px,
+            min_motion_score=ball_motion_threshold,
         ) if ball_dets else None
+
+        best_ball = ball_candidate
+        candidate_has_motion = ball_candidate is not None and has_local_ball_motion(
+            ball_candidate,
+            previous_frame_bgr,
+            frame_bgr,
+            min_motion_score=ball_motion_threshold,
+        )
+        if previous_ball is None:
+            best_ball = None
+            if ball_candidate is not None and candidate_has_motion:
+                if pending_ball is not None:
+                    initial_displacement = ball_center_distance(ball_candidate, pending_ball)
+                    if (
+                        ball_min_initial_displacement_px
+                        <= initial_displacement
+                        <= ball_max_jump_px
+                    ):
+                        best_ball = ball_candidate
+                pending_ball = ball_candidate
+            else:
+                pending_ball = None
 
         # ── Track players ──
         tracked = tracker.update(player_dets, ball=best_ball)
@@ -570,8 +599,10 @@ def run_process(
             best_ball,
             previous_frame_bgr,
             frame_bgr,
+            min_motion_score=ball_motion_threshold,
         ):
             previous_ball = best_ball
+            pending_ball = None
         previous_frame_bgr = frame_bgr.copy()
 
     # ── Write raw CSV ──

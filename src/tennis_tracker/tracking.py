@@ -279,6 +279,11 @@ def _center_distance(a: BallDetection, b: BallDetection) -> float:
     return _dist(a.center.x, a.center.y, b.center.x, b.center.y)
 
 
+def ball_center_distance(a: BallDetection, b: BallDetection) -> float:
+    """Return pixel distance between two ball detection centres."""
+    return _center_distance(a, b)
+
+
 def has_local_ball_motion(
     detection: BallDetection,
     previous_frame: Optional[np.ndarray],

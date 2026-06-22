@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from tennis_tracker.output import read_csv_rows
 from tennis_tracker.pipeline import (
     CourtKeypointMatch,
     SyntheticDetection,
@@ -389,6 +390,108 @@ class TestRealPipelineMocked:
         assert "missing_player_b" in summary["diagnostics_summary"]
         assert "missing_ball" in summary["diagnostics_summary"]
         assert "homography_invalid" in summary["diagnostics_summary"]
+
+    def test_static_ball_candidate_is_not_bootstrapped(
+        self, tmp_path: Path
+    ) -> None:
+        """A static court-line false positive should stay missing, not become track."""
+        from unittest.mock import MagicMock
+        from tennis_tracker.detection import BallDetection, BoundingBox
+
+        video_path = tmp_path / "static_line.mp4"
+        frames = []
+        for _ in range(6):
+            frame = np.zeros((100, 100, 3), dtype=np.uint8)
+            frame[48:52, 35:65] = 255
+            frames.append(frame)
+        write_video(frames, video_path, fps=25.0)
+
+        player_mock = MagicMock()
+        player_mock.predict.return_value = []
+        ball_mock = MagicMock()
+        ball_mock.predict.return_value = [
+            BallDetection(
+                bbox=BoundingBox(x1=35.0, y1=48.0, x2=65.0, y2=52.0),
+                center=PixelPoint(x=50.0, y=50.0),
+                confidence=0.2,
+            )
+        ]
+        court_mock = MagicMock()
+        court_mock.predict.return_value = []
+
+        raw_csv = tmp_path / "raw_static.csv"
+        smoothed_csv = tmp_path / "smoothed_static.csv"
+        out_video = tmp_path / "output_static.mp4"
+
+        summary = run_process(
+            video_path,
+            raw_csv,
+            smoothed_csv,
+            out_video,
+            player_detector=player_mock,
+            ball_detector=ball_mock,
+            court_detector=court_mock,
+            fps=25.0,
+        )
+
+        rows = list(read_csv_rows(raw_csv))
+        assert summary["raw_row_count"] == 6
+        assert all(row["ball_pixel_x"] == "" for row in rows)
+        assert "missing_ball" in summary["diagnostics_summary"]
+
+    def test_initial_ball_requires_two_moving_nearby_observations(
+        self, tmp_path: Path
+    ) -> None:
+        """Initial acquisition should confirm motion before emitting ball rows."""
+        from unittest.mock import MagicMock
+        from tennis_tracker.detection import BallDetection, BoundingBox
+
+        video_path = tmp_path / "moving_ball.mp4"
+        positions = [(20, 20), (24, 22), (28, 24), (32, 26)]
+        frames = []
+        for x, y in positions:
+            frame = np.zeros((100, 100, 3), dtype=np.uint8)
+            frame[y - 2:y + 3, x - 2:x + 3] = 255
+            frames.append(frame)
+        write_video(frames, video_path, fps=25.0)
+
+        player_mock = MagicMock()
+        player_mock.predict.return_value = []
+        ball_mock = MagicMock()
+        ball_mock.predict.side_effect = [
+            [
+                BallDetection(
+                    bbox=BoundingBox(x1=x - 2, y1=y - 2, x2=x + 2, y2=y + 2),
+                    center=PixelPoint(x=float(x), y=float(y)),
+                    confidence=0.4,
+                )
+            ]
+            for x, y in positions
+        ]
+        court_mock = MagicMock()
+        court_mock.predict.return_value = []
+
+        raw_csv = tmp_path / "raw_moving.csv"
+        smoothed_csv = tmp_path / "smoothed_moving.csv"
+        out_video = tmp_path / "output_moving.mp4"
+
+        run_process(
+            video_path,
+            raw_csv,
+            smoothed_csv,
+            out_video,
+            player_detector=player_mock,
+            ball_detector=ball_mock,
+            court_detector=court_mock,
+            fps=25.0,
+            ball_max_jump_px=20.0,
+        )
+
+        rows = list(read_csv_rows(raw_csv))
+        assert rows[0]["ball_pixel_x"] == ""
+        assert rows[1]["ball_pixel_x"] != ""
+        assert rows[2]["ball_pixel_x"] != ""
+        assert rows[3]["ball_pixel_x"] != ""
 
     def test_full_frame_read_count(self, short_video: Path, tmp_path: Path) -> None:
         """Should process the correct number of frames."""

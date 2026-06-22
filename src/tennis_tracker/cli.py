@@ -75,6 +75,24 @@ def main() -> None:
         default=0.25,
         help="Court keypoint detection confidence threshold",
     )
+    process_parser.add_argument(
+        "--ball-motion-threshold",
+        type=float,
+        default=5.0,
+        help="Minimum local frame-difference score required to accept a ball",
+    )
+    process_parser.add_argument(
+        "--ball-max-jump-px",
+        type=float,
+        default=180.0,
+        help="Maximum pixel jump allowed between confirmed ball detections",
+    )
+    process_parser.add_argument(
+        "--ball-min-initial-displacement-px",
+        type=float,
+        default=2.0,
+        help="Minimum movement needed to confirm initial ball acquisition",
+    )
 
     # --- train-ball ---
     train_ball_parser = subparsers.add_parser(
@@ -195,6 +213,9 @@ def _handle_process(args: argparse.Namespace) -> None:
         court_conf=args.court_conf,
         imgsz=args.imgsz,
         device=args.device,
+        ball_motion_threshold=args.ball_motion_threshold,
+        ball_max_jump_px=args.ball_max_jump_px,
+        ball_min_initial_displacement_px=args.ball_min_initial_displacement_px,
     )
 
     print(f"  Processed {summary['raw_row_count']} frames")
