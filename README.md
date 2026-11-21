@@ -4,7 +4,7 @@ A command-line pipeline that tracks players and the ball in tennis match footage
 
 ## Match preview
 
-![Four-second rally clip with annotated match footage and a top-down court above the 3D reconstruction](docs/assets/match-annotation.gif)
+![Four-second rally showing the tracked ball in the match footage, on a top-down court, and in the 3D replay](docs/assets/match-annotation.gif)
 
 The yellow trail follows the ball in each view. The 3D panel shows the estimated height above the court in meters.
 
