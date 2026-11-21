@@ -383,7 +383,7 @@ def run_process(
     court_y_scale: float = 1.0,
     player_court_margin_m: float = 1.5,
     player_baseline_margin_m: float = 5.0,
-    ball_projection_anchor: str = "bottom_center",
+    ball_projection_anchor: str = "center",
     top_view_court: str = "doubles",
     correct_ball_parallax: bool = True,
     show_3d_view: bool = False,
@@ -472,6 +472,7 @@ def run_process(
     homography_matrix = None
     prev_homography_matrix = None
     camera_pos: Optional[tuple[float, float, float]] = None
+    camera_positions_per_frame: list[Optional[tuple[float, float, float]]] = []
     homography_valid = False
     court_confidence: Optional[float] = None
     first_frame_processed = False
@@ -577,7 +578,10 @@ def run_process(
                                 homography_matrix = updated_h
                                 court_confidence = result.confidence
                                 homography_valid = True
-                                if camera_pos is None:
+                                # Re-estimate camera pose periodically to track
+                                # broadcast pan/zoom (a frame-0-only pose drifts
+                                # several meters over a clip, biasing heights).
+                                if camera_pos is None or idx % 15 == 0:
                                     ground_px = [
                                         (kp.pixel.x, kp.pixel.y)
                                         for kp in court_keypoints
@@ -591,9 +595,25 @@ def run_process(
                                         and (named := named_point_by_label(kp.label)) is not None
                                     ]
                                     fh, fw = frame_bgr.shape[:2]
-                                    camera_pos = estimate_camera_position(
+                                    cam_est = estimate_camera_position(
                                         ground_px, ground_ct, fw, fh
                                     )
+                                    if cam_est is not None:
+                                        if camera_pos is None:
+                                            camera_pos = cam_est
+                                        else:
+                                            # Reject implausible single-shot jumps,
+                                            # then EMA-smooth the pose over time.
+                                            jump = max(
+                                                abs(cam_est[k] - camera_pos[k])
+                                                for k in range(3)
+                                            )
+                                            if jump <= 6.0:
+                                                a = 0.3
+                                                camera_pos = tuple(
+                                                    a * cam_est[k] + (1 - a) * camera_pos[k]
+                                                    for k in range(3)
+                                                )
 
         first_frame_processed = True
 
@@ -732,6 +752,7 @@ def run_process(
         homographies_per_frame.append(
             homography_matrix.copy() if homography_matrix is not None else None
         )
+        camera_positions_per_frame.append(camera_pos)
 
         prev_homography_matrix = (
             homography_matrix.copy() if homography_matrix is not None else None
@@ -930,7 +951,10 @@ def run_process(
     ball_heights_m: Optional[list[Optional[float]]] = None
     if correct_ball_parallax and camera_pos is not None:
         smoothed_rows, ball_heights_m = correct_ball_elevation_with_heights(
-            smoothed_rows, camera_pos=camera_pos
+            smoothed_rows,
+            camera_pos=camera_pos,
+            camera_positions=camera_positions_per_frame,
+            anchor_rows=raw_rows,
         )
     smoothed_csv_path = Path(smoothed_csv_path)
     smoothed_csv_path.parent.mkdir(parents=True, exist_ok=True)

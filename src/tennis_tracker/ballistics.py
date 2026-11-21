@@ -1,4 +1,4 @@
-"""Hybrid bounce- and hit-anchored 3D elevation correction for 2D court coordinates.
+"""Bounce- and hit-anchored ballistic 3D elevation correction for 2D court coordinates.
 
 A planar court homography assumes every pixel lies on the ground plane
 (``z = 0``). For an elevated broadcast camera at ``(Xc, Yc, Zc)``, an airborne
@@ -7,18 +7,24 @@ ball at height ``z > 0`` projects along the camera ray to:
     x_proj = Xc + (Zc / (Zc - z)) * (x - Xc)
     y_proj = Yc + (Zc / (Zc - z)) * (y - Yc)
 
-At the far baseline (where ``y - Yc`` is ~45 m), even a normal 1.0–1.5 m strike
-height shifts ``y_proj`` by +5 to +8 meters *behind* the far player.
+At the far baseline even a normal 1.0-1.5 m strike height shifts ``y_proj`` by
+several meters *behind* the far player.
 
 This module recovers the 3D camera position from ground-plane court keypoints
-via ``cv2.solvePnP``, detects:
-  - **Bounces** (sharp upward cusps in image ``ball_pixel_y`` inside the court,
-    where ``z = 0`` so raw homography is exact), and
-  - **Player hits** (rally Y-direction reversals within reach of the near or far
-    player, where ``y_true ≈ y_player`` and ``z_hit`` is physically plausible),
+via ``cv2.solvePnP`` and detects two kinds of physically grounded anchors:
 
-and reconstructs ray-consistent ground footprints ``(x_true, y_true)`` between
-consecutive anchors while leaving unreturned winners untouched.
+  - **Bounces** (``z = 0``): a sharp drop in the ball's downward image velocity.
+    The detector is adaptive to court depth (far-court bounces move only a few
+    pixels per frame) and works across short tracking gaps, so it does not rely
+    on a fixed pixel cusp threshold or on interpolated pixels that erase cusps.
+  - **Player hits** (``y_true ~= y_player``): rally depth reversals within reach
+    of the near or far player, with a physically plausible contact height.
+
+Between consecutive valid anchors each flight arc is reconstructed as a
+gravity-constrained parabola in ``z``. The ball is then placed on its camera ray
+at that height. Because the arc is physical by construction, this avoids the
+``z = 0`` plateaus, single-frame plunges, and homography-jitter amplification
+produced by a linear ground-depth interpolation.
 """
 
 from __future__ import annotations
@@ -89,6 +95,19 @@ def estimate_camera_position(
     return (best[1], best[2], best[3])
 
 
+def _cam_at(
+    camera_positions: Optional[Sequence[Optional[tuple[float, float, float]]]],
+    idx: int,
+    fallback: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Return the per-frame camera pose, falling back to *fallback* when absent."""
+    if camera_positions is not None and 0 <= idx < len(camera_positions):
+        cam = camera_positions[idx]
+        if cam is not None:
+            return cam
+    return fallback
+
+
 def _get_side_players(
     row: OutputRow,
 ) -> tuple[Optional[tuple[float, float]], Optional[tuple[float, float]]]:
@@ -128,7 +147,7 @@ def _nearest_side_player(
 def _is_valid_flight_pair(kind0: str, y0: float, kind1: str, y1: float) -> bool:
     """Return True if ``(kind0, kind1)`` represents a single physical flight arc.
 
-    Prevents linearly bridging across a missed hit (such as ``far_bounce`` to
+    Prevents bridging across a missed hit (such as ``far_bounce`` to
     ``near_bounce``, or ``near_hit`` straight to ``near_hit``), which would
     place the reconstructed ball in the wrong part of the court.
     """
@@ -147,54 +166,38 @@ def _is_valid_flight_pair(kind0: str, y0: float, kind1: str, y1: float) -> bool:
     return False
 
 
-def _detect_anchors(
+def _detect_hits(
     rows: Sequence[OutputRow],
     camera_pos: tuple[float, float, float],
+    camera_positions: Optional[Sequence[Optional[tuple[float, float, float]]]],
+    raw_anchors: dict[int, tuple[str, float, float, float]],
     *,
-    max_hit_reach_m: float = 4.0,
-    max_hit_height_m: float = 6.5,
-) -> dict[int, tuple[str, float, float]]:
-    """Detect bounce (``z=0``) and player-hit (``y_true=y_player``) anchors.
-
-    Returns a mapping ``frame_index -> (kind, y_true_m, z_est_m)`` where
-    ``kind`` is one of ``"far_bounce"``, ``"near_bounce"``, ``"far_hit"``,
-    or ``"near_hit"``.
-    """
-    xc, yc, zc = camera_pos
+    max_hit_reach_m: float,
+    max_hit_height_m: float,
+) -> None:
+    """Detect player-hit anchors (rally depth reversals) into *raw_anchors*."""
     n = len(rows)
     bx = [r.ball_x_m for r in rows]
     by = [r.ball_y_m for r in rows]
-    bpy = [r.ball_pixel_y for r in rows]
 
-    # idx -> (kind, y_true, z_est, score)
-    raw_anchors: dict[int, tuple[str, float, float, float]] = {}
+    def _try_hit(i: int, side: str, score: float) -> None:
+        xc, yc, zc = _cam_at(camera_positions, i, camera_pos)
+        player = _nearest_side_player(rows, i, side)
+        if player is None or by[i] is None or bx[i] is None:
+            return
+        if by[i] <= player[1] or abs(by[i] - yc) <= 1e-6:
+            return
+        s_hit = (player[1] - yc) / (by[i] - yc)
+        z_hit = zc * (1.0 - s_hit)
+        x_hit = xc + s_hit * (bx[i] - xc)
+        if 0.0 <= z_hit <= max_hit_height_m and abs(x_hit - player[0]) <= max_hit_reach_m:
+            kind = "far_hit" if side == "far" else "near_hit"
+            raw_anchors[i] = (kind, player[1], z_hit, score)
 
-    # 1. Detect bounces: sharp upward reversal in image Y (ball_pixel_y local max)
-    for i in range(2, n - 2):
-        if bpy[i] is None or by[i] is None or bx[i] is None:
-            continue
-        if bpy[i - 1] is None or bpy[i + 1] is None:
-            continue
-        assert by[i] is not None and bx[i] is not None
-        assert bpy[i] is not None and bpy[i - 1] is not None and bpy[i + 1] is not None
-        if not (-13.0 <= by[i] <= 13.0 and -6.5 <= bx[i] <= 6.5):
-            continue
-        dv_in = bpy[i] - bpy[i - 1]
-        dv_out = bpy[i + 1] - bpy[i]
-        cusp = dv_in - dv_out
-        if dv_in >= -0.5 and dv_out <= -2.5 and cusp >= 5.0:
-            win = [bpy[k] for k in range(i - 2, i + 3) if bpy[k] is not None]
-            if win and bpy[i] == max(win):
-                b_kind = "far_bounce" if by[i] >= 0.0 else "near_bounce"
-                raw_anchors[i] = (b_kind, by[i], 0.0, cusp)
-
-    # 2. Detect player hits: Y-direction reversals within reach of near/far player.
-    #    Use a +-12 frame window so slow lobs that linger near their apex still
-    #    satisfy the reversal prominence threshold.
+    # Depth reversals within a +-12 frame window (slow lobs linger near apex).
     for i in range(3, n - 3):
         if by[i] is None or bx[i] is None:
             continue
-        assert by[i] is not None and bx[i] is not None
         win_vals = [
             (k, by[k])
             for k in range(max(0, i - 12), min(n, i + 13))
@@ -202,54 +205,31 @@ def _detect_anchors(
         ]
         if len(win_vals) < 5:
             continue
-        left_vals = [v for k, v in win_vals if k < i and v is not None]
-        right_vals = [v for k, v in win_vals if k > i and v is not None]
+        left_vals = [v for k, v in win_vals if k < i]
+        right_vals = [v for k, v in win_vals if k > i]
         if not left_vals or not right_vals:
             continue
+        all_vals = [v for _, v in win_vals]
 
-        all_vals = [v for _, v in win_vals if v is not None]
-
-        # Far-side return (local maximum in y_proj)
         if by[i] > 4.0 and by[i] >= max(all_vals):
             prom_l = by[i] - min(left_vals)
             prom_r = by[i] - min(right_vals)
             if prom_l >= 0.5 and prom_r >= 0.5:
-                far_p = _nearest_side_player(rows, i, "far")
-                if far_p is not None and by[i] > far_p[1] and abs(by[i] - yc) > 1e-6:
-                    s_hit = (far_p[1] - yc) / (by[i] - yc)
-                    z_hit = zc * (1.0 - s_hit)
-                    x_hit = xc + s_hit * (bx[i] - xc)
-                    if (
-                        0.0 <= z_hit <= max_hit_height_m
-                        and abs(x_hit - far_p[0]) <= max_hit_reach_m
-                    ):
-                        raw_anchors[i] = ("far_hit", far_p[1], z_hit, prom_l + prom_r)
+                _try_hit(i, "far", prom_l + prom_r)
 
-        # Near-side return (local minimum in y_proj)
         if by[i] < -4.0 and by[i] <= min(all_vals):
             prom_l = max(left_vals) - by[i]
             prom_r = max(right_vals) - by[i]
             if prom_l >= 0.5 and prom_r >= 0.5:
-                near_p = _nearest_side_player(rows, i, "near")
-                if near_p is not None and by[i] > near_p[1] and abs(by[i] - yc) > 1e-6:
-                    s_hit = (near_p[1] - yc) / (by[i] - yc)
-                    z_hit = zc * (1.0 - s_hit)
-                    x_hit = xc + s_hit * (bx[i] - xc)
-                    if (
-                        0.0 <= z_hit <= max_hit_height_m
-                        and abs(x_hit - near_p[0]) <= max_hit_reach_m
-                    ):
-                        raw_anchors[i] = ("near_hit", near_p[1], z_hit, prom_l + prom_r)
+                _try_hit(i, "near", prom_l + prom_r)
 
-    # 3. Gap-adjacent far/near hit detection: if the ball rises to the far player
-    #    right before a tracking gap (>=4 frames) and resumes heading back toward
-    #    the net after the gap, anchor the contact right at the player.
+    # Gap-adjacent far hits: ball rises to the far player right before a tracking
+    # gap (>=4 frames) and resumes heading back toward the net after the gap.
     for i in range(4, n - 5):
         if i in raw_anchors or by[i] is None or bx[i] is None:
             continue
         if by[i + 1] is not None:
             continue
-        # Measure gap length after i
         j = i + 1
         while j < n and by[j] is None:
             j += 1
@@ -259,21 +239,102 @@ def _detect_anchors(
         post_vals = [by[k] for k in range(j, min(n, j + 8)) if by[k] is not None]
         if not prev_vals or not post_vals:
             continue
-        assert by[i] is not None and bx[i] is not None
         if by[i] > 6.0 and by[i] > min(prev_vals) + 1.0 and min(post_vals) < by[i] - 2.0:
-            far_p = _nearest_side_player(rows, i, "far")
-            if far_p is not None and by[i] > far_p[1] and abs(by[i] - yc) > 1e-6:
-                s_hit = (far_p[1] - yc) / (by[i] - yc)
-                z_hit = zc * (1.0 - s_hit)
-                x_hit = xc + s_hit * (bx[i] - xc)
-                if 0.0 <= z_hit <= max_hit_height_m and abs(x_hit - far_p[0]) <= max_hit_reach_m:
-                    raw_anchors[i] = ("far_hit", far_p[1], z_hit, 1.0)
+            _try_hit(i, "far", 1.0)
 
-    # 4. Deduplicate same-kind anchors closer than 15 frames (keep highest score)
+
+def _detect_bounces(
+    rows: Sequence[OutputRow],
+    raw_anchors: dict[int, tuple[str, float, float, float]],
+    *,
+    hit_indices: Sequence[int],
+) -> None:
+    """Detect bounce anchors (``z = 0``) via an adaptive image-velocity kink.
+
+    A bounce reverses the ball's vertical motion, producing a sharp drop in its
+    downward image velocity ``d(pixel_y)/dt``. The threshold scales with the
+    local ball speed so that small far-court cusps are caught while noise is
+    rejected, and velocities are measured between *observed* frames so short
+    tracking gaps (where the contact frame is missing) still register.
+    """
+    n = len(rows)
+    bx = [r.ball_x_m for r in rows]
+    by = [r.ball_y_m for r in rows]
+    bpy = [r.ball_pixel_y for r in rows]
+
+    observed = [
+        i for i in range(n)
+        if bpy[i] is not None and by[i] is not None and bx[i] is not None
+    ]
+    if len(observed) < 3:
+        return
+
+    # Per-frame downward image velocity assigned to the arrival frame.
+    vel = np.full(n, np.nan)
+    for a, b in zip(observed, observed[1:]):
+        vel[b] = (bpy[b] - bpy[a]) / (b - a)
+
+    next_obs = {a: b for a, b in zip(observed, observed[1:])}
+    hit_set = set(hit_indices)
+
+    def _near_hit(i: int) -> bool:
+        return any(abs(i - h) <= 5 for h in hit_set)
+
+    for i in observed:
+        s = next_obs.get(i)
+        if s is None or np.isnan(vel[i]) or np.isnan(vel[s]):
+            continue
+        if _near_hit(i):
+            continue
+        if not (-13.0 <= by[i] <= 13.0 and -6.5 <= bx[i] <= 6.5):
+            continue
+        v_in = float(vel[i])
+        v_out = float(vel[s])
+        if v_in <= 0.5:
+            continue
+        kink = v_in - v_out
+        # Threshold scales with the *approach* speed so small far-court cusps
+        # are caught without being masked by the fast post-bounce departure.
+        threshold = max(1.5, 0.55 * v_in)
+        if kink < threshold:
+            continue
+        # Persistence: the departure velocity must stay well below the approach,
+        # rejecting single-frame noise wiggles that immediately resume.
+        s2 = next_obs.get(s)
+        v_out2 = float(vel[s2]) if s2 is not None and not np.isnan(vel[s2]) else v_out
+        if v_out2 > v_in - 0.6 * kink:
+            continue
+        kind = "far_bounce" if by[i] >= 0.0 else "near_bounce"
+        raw_anchors[i] = (kind, by[i], 0.0, kink)
+
+
+def _detect_anchors(
+    rows: Sequence[OutputRow],
+    camera_pos: tuple[float, float, float],
+    *,
+    camera_positions: Optional[Sequence[Optional[tuple[float, float, float]]]] = None,
+    max_hit_reach_m: float = 4.0,
+    max_hit_height_m: float = 3.5,
+) -> dict[int, tuple[str, float, float]]:
+    """Detect bounce (``z=0``) and player-hit (``y_true=y_player``) anchors.
+
+    Returns a mapping ``frame_index -> (kind, y_true_m, z_est_m)`` where ``kind``
+    is one of ``"far_bounce"``, ``"near_bounce"``, ``"far_hit"``, ``"near_hit"``.
+    """
+    # idx -> (kind, y_true, z_est, score)
+    raw_anchors: dict[int, tuple[str, float, float, float]] = {}
+
+    _detect_hits(
+        rows, camera_pos, camera_positions, raw_anchors,
+        max_hit_reach_m=max_hit_reach_m, max_hit_height_m=max_hit_height_m,
+    )
+    hit_indices = [i for i, a in raw_anchors.items() if a[0].endswith("hit")]
+    _detect_bounces(rows, raw_anchors, hit_indices=hit_indices)
+
+    # Deduplicate same-kind anchors closer than 15 frames (keep highest score).
     anchors: dict[int, tuple[str, float, float]] = {}
     for idx in sorted(raw_anchors.keys()):
         kind, y_t, z_e, score = raw_anchors[idx]
-        # Check if a recent anchor of the same kind already exists
         dup_prev = None
         for prev_idx in reversed(sorted(anchors.keys())):
             if idx - prev_idx > 15:
@@ -290,65 +351,98 @@ def _detect_anchors(
     return anchors
 
 
+def _estimate_fps(rows: Sequence[OutputRow]) -> float:
+    """Estimate frame rate from row timestamps (fallback 30)."""
+    diffs = [
+        rows[i + 1].time_s - rows[i].time_s
+        for i in range(min(len(rows) - 1, 30))
+        if rows[i + 1].time_s > rows[i].time_s
+    ]
+    if not diffs:
+        return 30.0
+    dt = float(np.median(diffs))
+    return 1.0 / dt if dt > 1e-6 else 30.0
+
+
 def correct_ball_elevation_with_heights(
     rows: Sequence[OutputRow],
     camera_pos: Optional[tuple[float, float, float]] = None,
     *,
+    camera_positions: Optional[Sequence[Optional[tuple[float, float, float]]]] = None,
+    anchor_rows: Optional[Sequence[OutputRow]] = None,
     max_segment_frames: int = 120,
     max_segment_gap: int = 18,
     max_ball_height_m: float = 7.5,
+    gravity_m_s2: float = 9.81,
+    min_segment_frames: int = 3,
 ) -> tuple[list[OutputRow], list[Optional[float]]]:
-    """Correct 2D ball court coordinates and return estimated per-frame heights ``z_m``.
+    """Correct 2D ball court coordinates and return per-frame heights ``z_m``.
 
-    Projects each ball observation along its 3D camera ray onto the estimated
-    ground-plane depth interpolated between physically valid consecutive anchor
-    pairs (``hit → bounce``, ``bounce → hit``, or cross-court ``hit → hit``),
-    clamping implied elevation ``z`` to ``[0, max_ball_height_m]``.
+    Each flight arc between physically valid consecutive anchors is modelled as
+    a gravity-constrained parabola in ``z``; the ball is placed on its camera ray
+    at that height, yielding ray-consistent ground footprints ``(x_true, y_true)``.
+    Unreturned winners (no closing anchor) are left untouched.
 
-    Returns ``(corrected_rows, ball_heights_m)`` where ``ball_heights_m[i]`` is
-    the estimated height above the court in meters (``None`` when ball is missing).
-    Does not mutate *rows*.
+    Parameters
+    ----------
+    anchor_rows :
+        Optional raw (pre-interpolation) rows used for anchor detection. Pass the
+        raw detections so bounce cusps erased by gap interpolation are recovered.
+    camera_positions :
+        Optional per-frame camera poses (e.g. to track broadcast pan/zoom). Falls
+        back to *camera_pos* where absent.
+
+    Returns ``(corrected_rows, ball_heights_m)``; does not mutate *rows*.
     """
     if not rows:
         return [], []
 
-    cam = camera_pos if camera_pos is not None else _DEFAULT_CAMERA_POS
-    xc, yc, zc = cam
-    if zc <= 1.0:
-        heights = [0.0 if r.ball_y_m is not None else None for r in rows]
-        return list(rows), heights
+    fallback_cam = camera_pos if camera_pos is not None else _DEFAULT_CAMERA_POS
+    det_rows = anchor_rows if anchor_rows is not None else rows
+    anchors = _detect_anchors(det_rows, fallback_cam, camera_positions=camera_positions)
 
-    anchors = _detect_anchors(rows, cam)
+    present = [r.ball_y_m is not None for r in rows]
     if not anchors:
-        heights = [0.0 if r.ball_y_m is not None else None for r in rows]
+        heights = [0.0 if p else None for p in present]
         return list(rows), heights
 
+    fps = _estimate_fps(rows)
+    g = gravity_m_s2
     new_bx: list[Optional[float]] = [r.ball_x_m for r in rows]
     new_by: list[Optional[float]] = [r.ball_y_m for r in rows]
-    ball_z: list[Optional[float]] = [0.0 if r.ball_y_m is not None else None for r in rows]
-    s_min = max(0.18, 1.0 - max_ball_height_m / zc)
-
-    def _apply_scale(t: int, y_target: float) -> None:
-        raw_x = rows[t].ball_x_m
-        raw_y = rows[t].ball_y_m
-        if raw_x is None or raw_y is None or abs(raw_y - yc) < 1e-6:
-            return
-        s = (y_target - yc) / (raw_y - yc)
-        s = max(s_min, min(1.0, s))
-        new_bx[t] = xc + s * (raw_x - xc)
-        new_by[t] = yc + s * (raw_y - yc)
-        ball_z[t] = zc * (1.0 - s)
+    ball_z: list[Optional[float]] = [0.0 if p else None for p in present]
 
     sorted_a = sorted(anchors.keys())
 
-    # 1. Reconstruct flight arcs between physically valid consecutive anchors
+    def _set_height(t: int, zt: float) -> None:
+        raw_x = rows[t].ball_x_m
+        raw_y = rows[t].ball_y_m
+        if raw_x is None or raw_y is None:
+            return
+        xc, yc, zc = _cam_at(camera_positions, t, fallback_cam)
+        if zc <= 1.0:
+            return
+        zt = max(0.0, min(max_ball_height_m, zt))
+        s = 1.0 - zt / zc
+        new_bx[t] = xc + s * (raw_x - xc)
+        new_by[t] = yc + s * (raw_y - yc)
+        ball_z[t] = zt
+
+    # 1. Reconstruct ballistic flight arcs between valid consecutive anchors.
     for idx_a in range(len(sorted_a) - 1):
         t0, t1 = sorted_a[idx_a], sorted_a[idx_a + 1]
-        kind0, y0, _ = anchors[t0]
-        kind1, y1, _ = anchors[t1]
+        kind0, y0, z0 = anchors[t0]
+        kind1, y1, z1 = anchors[t1]
         if not _is_valid_flight_pair(kind0, y0, kind1, y1):
             continue
-        if t1 - t0 > max_segment_frames:
+        span = t1 - t0
+        if span > max_segment_frames or span < min_segment_frames:
+            continue
+        # A hit->hit arc that crosses the whole court in a few frames is spurious.
+        if kind0.endswith("hit") and kind1.endswith("hit") and span < 8:
+            continue
+        duration = span / fps
+        if duration > 1e-6 and abs(y1 - y0) / duration > 60.0:
             continue
         max_miss, cur_miss = 0, 0
         for t in range(t0, t1 + 1):
@@ -360,70 +454,73 @@ def correct_ball_elevation_with_heights(
         if max_miss > max_segment_gap:
             continue
 
-        span = max(1, t1 - t0)
+        # Parabola z(τ) = z0 + v0 τ - ½ g τ² satisfying z(T) = z1.
+        v0 = (z1 - z0 + 0.5 * g * duration * duration) / duration
         for t in range(t0, t1 + 1):
-            frac = (t - t0) / span
-            _apply_scale(t, y0 + frac * (y1 - y0))
+            if rows[t].ball_y_m is None:
+                continue
+            tau = (t - t0) / fps
+            _set_height(t, z0 + v0 * tau - 0.5 * g * tau * tau)
 
-    # 2. Handle isolated serve tosses directly above the far server at segment start
+    # 2. Isolated serve tosses directly above the far server at segment start.
     for t_anc in sorted_a:
-        kind, y_anc, _ = anchors[t_anc]
+        kind, y_anc, z_anc = anchors[t_anc]
         if kind != "far_hit":
             continue
-        _apply_scale(t_anc, y_anc)
+        _set_height(t_anc, z_anc)
         has_prev_anchor = any(
             0 < t_anc - prev <= max_segment_frames
             and _is_valid_flight_pair(anchors[prev][0], anchors[prev][1], kind, y_anc)
             for prev in sorted_a
             if prev < t_anc
         )
-        if not has_prev_anchor:
-            far_p = _nearest_side_player(rows, t_anc, "far")
-            if far_p is not None:
-                for t in range(t_anc - 1, max(-1, t_anc - 25), -1):
-                    raw_x, raw_y = rows[t].ball_x_m, rows[t].ball_y_m
-                    if raw_x is None or raw_y is None or raw_y <= far_p[1]:
-                        break
-                    s = max(s_min, min(1.0, (far_p[1] - yc) / (raw_y - yc)))
-                    x_corr = xc + s * (raw_x - xc)
-                    if abs(x_corr - far_p[0]) > 2.5:
-                        break
-                    new_bx[t] = x_corr
-                    new_by[t] = yc + s * (raw_y - yc)
-                    ball_z[t] = zc * (1.0 - s)
-
-    # Light 3-frame smoothing on estimated height z (preserving exact 0 at bounces)
-    smoothed_z = list(ball_z)
-    for i in range(1, len(ball_z) - 1):
-        if i in anchors and anchors[i][0].endswith("bounce"):
-            smoothed_z[i] = 0.0
+        if has_prev_anchor:
             continue
-        if ball_z[i] is not None and ball_z[i - 1] is not None and ball_z[i + 1] is not None:
-            smoothed_z[i] = (
-                0.25 * ball_z[i - 1] + 0.5 * ball_z[i] + 0.25 * ball_z[i + 1]  # type: ignore[operator]
-            )
+        far_p = _nearest_side_player(det_rows, t_anc, "far")
+        if far_p is None:
+            continue
+        for t in range(t_anc - 1, max(-1, t_anc - 25), -1):
+            raw_x, raw_y = rows[t].ball_x_m, rows[t].ball_y_m
+            if raw_x is None or raw_y is None or raw_y <= far_p[1]:
+                break
+            xc, yc, zc = _cam_at(camera_positions, t, fallback_cam)
+            if zc <= 1.0 or abs(raw_y - yc) < 1e-6:
+                break
+            s = max(0.0, min(1.0, (far_p[1] - yc) / (raw_y - yc)))
+            x_corr = xc + s * (raw_x - xc)
+            if abs(x_corr - far_p[0]) > 2.5:
+                break
+            new_bx[t] = x_corr
+            new_by[t] = yc + s * (raw_y - yc)
+            ball_z[t] = zc * (1.0 - s)
 
     corrected = [
         replace(row, ball_x_m=new_bx[i], ball_y_m=new_by[i])
         for i, row in enumerate(rows)
     ]
-    return corrected, smoothed_z
+    return corrected, ball_z
 
 
 def correct_ball_elevation(
     rows: Sequence[OutputRow],
     camera_pos: Optional[tuple[float, float, float]] = None,
     *,
+    camera_positions: Optional[Sequence[Optional[tuple[float, float, float]]]] = None,
+    anchor_rows: Optional[Sequence[OutputRow]] = None,
     max_segment_frames: int = 120,
     max_segment_gap: int = 18,
     max_ball_height_m: float = 7.5,
+    gravity_m_s2: float = 9.81,
 ) -> list[OutputRow]:
     """Correct 2D ball court coordinates for airborne height parallax."""
     corrected, _ = correct_ball_elevation_with_heights(
         rows,
         camera_pos=camera_pos,
+        camera_positions=camera_positions,
+        anchor_rows=anchor_rows,
         max_segment_frames=max_segment_frames,
         max_segment_gap=max_segment_gap,
         max_ball_height_m=max_ball_height_m,
+        gravity_m_s2=gravity_m_s2,
     )
     return corrected

@@ -136,7 +136,7 @@ def main() -> None:
     process_parser.add_argument(
         "--ball-projection-anchor",
         choices=["center", "bottom_center"],
-        default="bottom_center",
+        default="center",
         help="Ball bbox point used for court-plane projection",
     )
     process_parser.add_argument(
