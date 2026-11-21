@@ -1,6 +1,12 @@
 # Tennis Video Player/Ball Tracking and Court-Plane Coordinate Extraction
 
-CLI-based computer vision pipeline that processes fixed-camera tennis match recordings and outputs research/production-grade 2D court-plane coordinates for players and ball.
+A command-line pipeline that tracks players and the ball in tennis match footage, exports court coordinates, and estimates ball height for an optional 3D replay.
+
+## Match preview
+
+![Four-second rally clip with annotated match footage and a top-down court above the 3D reconstruction](docs/assets/match-annotation.gif)
+
+The yellow trail follows the ball in each view. The 3D panel shows the estimated height above the court in meters.
 
 ## Quick Start
 
@@ -190,7 +196,7 @@ When `--auto-optimize-models` is enabled (default) in the `process` command, the
 # Default input (data/input/match.mp4) on a Colab T4 GPU
 ./scripts/process_video.sh
 
-# Custom video path and extra options (e.g. L4 GPU, side-by-side 3D corner view)
+# Add the 3D corner view below the match footage and 2D court
 ./scripts/process_video.sh data/input/match.mp4 --3d-court-view
 ./scripts/process_video.sh data/input/match.mp4 --3d --gpu L4
 
@@ -220,8 +226,8 @@ The pipeline:
 1. Loads models (or optimized artifacts)
 2. For each frame: detects court keypoints, estimates homography, detects players and ball, tracks player labels, projects to court-plane coordinates
 3. Writes raw CSV (unsmoothed per-frame detections)
-4. Applies temporal smoothing and writes smoothed CSV
-5. Renders annotated video with source overlay and side top-view court panel
+4. Fills short tracking gaps, estimates ball height using detected bounces and hits, and writes the corrected court coordinates to the smoothed CSV
+5. Renders the annotated video in a 16:9 layout
 
 **Missing/low-confidence detections** produce diagnostic flags rather than crashes or fabricated coordinates.
 
@@ -290,9 +296,9 @@ Missing values are represented as empty CSV cells (never 0 or "0").
 
 ### Annotated Video
 
-The output video contains:
-- Resized source frame with player bounding boxes, ball trail, court keypoints, diagnostics text
-- Side panel with top-down 2D court animation showing player and ball positions in real-world court coordinates
+The annotated MP4 is 1280 × 720 (16:9) by default. The source footage keeps its original aspect ratio and shows player markers, the ball trail, and tracking diagnostics. The 2D court beside it shows player and ball positions in court coordinates.
+
+Pass `--3d-court-view` to add the 3D reconstruction below both views, as shown in the [match preview](#match-preview). The panel shows estimated ball height, which is not exported in the CSVs.
 
 ## Coordinate System
 
