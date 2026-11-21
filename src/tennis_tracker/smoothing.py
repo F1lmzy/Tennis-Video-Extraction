@@ -17,7 +17,18 @@ from tennis_tracker.types import OutputRow
 _DEFAULT_MAX_INTERP_GAP: int = 5
 
 
-def _interpolate_1d(values: list[Optional[float]], max_gap: int) -> list[Optional[float]]:
+_DEFAULT_MAX_BALL_STEP_M: float = 4.0
+"""Max per-frame court-meter step allowed when interpolating ball gaps."""
+
+_DEFAULT_MAX_BALL_STEP_PX: float = 120.0
+"""Max per-frame pixel step allowed when interpolating ball gaps."""
+
+
+def _interpolate_1d(
+    values: list[Optional[float]],
+    max_gap: int,
+    max_step: Optional[float] = None,
+) -> list[Optional[float]]:
     """Linearly interpolate short gaps in a 1-D list of optional floats.
 
     Parameters
@@ -27,6 +38,10 @@ def _interpolate_1d(values: list[Optional[float]], max_gap: int) -> list[Optiona
     max_gap :
         Maximum number of consecutive None values that will be interpolated.
         Longer gaps remain None.
+    max_step :
+        Optional maximum allowed change per frame across the gap. If
+        ``abs(right_val - left_val) / (gap_len + 1) > max_step``, the gap is
+        treated as a discontinuity/teleport and left uninterpolated.
 
     Returns
     -------
@@ -72,6 +87,10 @@ def _interpolate_1d(values: list[Optional[float]], max_gap: int) -> list[Optiona
 
         # Both sides must be known to interpolate
         if left_val is None or right_val is None:
+            continue
+
+        # Do not bridge across implausible teleports/discontinuities
+        if max_step is not None and abs(right_val - left_val) / (gap_len + 1) > max_step:
             continue
 
         # Linear interpolation
@@ -121,8 +140,12 @@ def smooth_output_rows(
     # Extract the coordinate fields to interpolate
     raw_a_x = [r.player_a_x_m for r in rows]
     raw_a_y = [r.player_a_y_m for r in rows]
+    raw_a_pixel_x = [r.player_a_pixel_x for r in rows]
+    raw_a_pixel_y = [r.player_a_pixel_y for r in rows]
     raw_b_x = [r.player_b_x_m for r in rows]
     raw_b_y = [r.player_b_y_m for r in rows]
+    raw_b_pixel_x = [r.player_b_pixel_x for r in rows]
+    raw_b_pixel_y = [r.player_b_pixel_y for r in rows]
     raw_ball_x = [r.ball_x_m for r in rows]
     raw_ball_y = [r.ball_y_m for r in rows]
     raw_ball_pixel_x = [r.ball_pixel_x for r in rows]
@@ -131,12 +154,20 @@ def smooth_output_rows(
     # Interpolate
     smooth_a_x = _interpolate_1d(raw_a_x, max_interp_gap)
     smooth_a_y = _interpolate_1d(raw_a_y, max_interp_gap)
+    smooth_a_pixel_x = _interpolate_1d(raw_a_pixel_x, max_interp_gap)
+    smooth_a_pixel_y = _interpolate_1d(raw_a_pixel_y, max_interp_gap)
     smooth_b_x = _interpolate_1d(raw_b_x, max_interp_gap)
     smooth_b_y = _interpolate_1d(raw_b_y, max_interp_gap)
-    smooth_ball_x = _interpolate_1d(raw_ball_x, max_interp_gap)
-    smooth_ball_y = _interpolate_1d(raw_ball_y, max_interp_gap)
-    smooth_ball_pixel_x = _interpolate_1d(raw_ball_pixel_x, max_interp_gap)
-    smooth_ball_pixel_y = _interpolate_1d(raw_ball_pixel_y, max_interp_gap)
+    smooth_b_pixel_x = _interpolate_1d(raw_b_pixel_x, max_interp_gap)
+    smooth_b_pixel_y = _interpolate_1d(raw_b_pixel_y, max_interp_gap)
+    smooth_ball_x = _interpolate_1d(raw_ball_x, max_interp_gap, max_step=_DEFAULT_MAX_BALL_STEP_M)
+    smooth_ball_y = _interpolate_1d(raw_ball_y, max_interp_gap, max_step=_DEFAULT_MAX_BALL_STEP_M)
+    smooth_ball_pixel_x = _interpolate_1d(
+        raw_ball_pixel_x, max_interp_gap, max_step=_DEFAULT_MAX_BALL_STEP_PX
+    )
+    smooth_ball_pixel_y = _interpolate_1d(
+        raw_ball_pixel_y, max_interp_gap, max_step=_DEFAULT_MAX_BALL_STEP_PX
+    )
 
     # Confidence propagation: backward fill from nearest known observation
     def _backward_fill(values: list[Optional[float]]) -> list[Optional[float]]:
@@ -163,13 +194,13 @@ def smooth_output_rows(
                 time_s=row.time_s,
                 player_a_x_m=smooth_a_x[i],
                 player_a_y_m=smooth_a_y[i],
-                player_a_pixel_x=row.player_a_pixel_x,
-                player_a_pixel_y=row.player_a_pixel_y,
+                player_a_pixel_x=smooth_a_pixel_x[i],
+                player_a_pixel_y=smooth_a_pixel_y[i],
                 player_a_confidence=bfill_a_conf[i],
                 player_b_x_m=smooth_b_x[i],
                 player_b_y_m=smooth_b_y[i],
-                player_b_pixel_x=row.player_b_pixel_x,
-                player_b_pixel_y=row.player_b_pixel_y,
+                player_b_pixel_x=smooth_b_pixel_x[i],
+                player_b_pixel_y=smooth_b_pixel_y[i],
                 player_b_confidence=bfill_b_conf[i],
                 ball_x_m=smooth_ball_x[i],
                 ball_y_m=smooth_ball_y[i],

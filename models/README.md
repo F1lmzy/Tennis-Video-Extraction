@@ -77,6 +77,16 @@ uv run python -m tennis_tracker.train_court \
   --output models/court_keypoints_yolo26.pt
 ```
 
+### Remote GPU Training via Google Colab CLI
+
+```bash
+# Train ball model on Colab T4 GPU and download weights to models/ball_yolo26.pt
+uv run python scripts/train_on_colab.py --task ball --gpu T4 --epochs 100 --imgsz 1280
+
+# Train court keypoint model on Colab T4 GPU
+uv run python scripts/train_on_colab.py --task court --gpu T4 --epochs 100
+```
+
 ## Model Optimization
 
 ```bash

@@ -93,6 +93,20 @@ class TestInterpolation:
         assert smoothed[1].ball_x_m == pytest.approx(1.0, abs=1e-6)
         assert smoothed[1].ball_y_m == pytest.approx(1.0, abs=1e-6)
 
+    def test_ball_teleport_gap_is_not_interpolated(self) -> None:
+        """Implausible jumps across a short gap should not be linearly bridged."""
+        rows = [
+            _row(0, 0.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=-4.0, bally=2.0),
+            _row(1, 1.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=None, bally=None),
+            _row(2, 2.0, ax=1.0, ay=2.0, bx=3.0, by=4.0, ballx=0.0, bally=24.0),
+        ]
+        rows[0].ball_pixel_x, rows[0].ball_pixel_y = 600.0, 380.0
+        rows[2].ball_pixel_x, rows[2].ball_pixel_y = 928.0, 120.0
+        smoothed = smooth_output_rows(rows)
+        assert smoothed[1].ball_y_m is None
+        assert smoothed[1].ball_pixel_x is None
+        assert smoothed[1].ball_pixel_y is None
+
     def test_long_gap_remains_missing(self) -> None:
         """A gap longer than max_gap should not be interpolated."""
         rows = [
@@ -191,6 +205,11 @@ class TestMultipleFields:
         # Player B interpolated
         assert smoothed[1].player_b_x_m == pytest.approx(12.0, abs=1e-6)
         assert smoothed[1].player_b_y_m == pytest.approx(12.0, abs=1e-6)
+        # Player pixel coordinates are also interpolated
+        assert smoothed[1].player_a_pixel_x == pytest.approx(100.0, abs=1e-6)
+        assert smoothed[1].player_a_pixel_y == pytest.approx(200.0, abs=1e-6)
+        assert smoothed[1].player_b_pixel_x == pytest.approx(300.0, abs=1e-6)
+        assert smoothed[1].player_b_pixel_y == pytest.approx(400.0, abs=1e-6)
 
     def test_diagnostics_preserved(self) -> None:
         """Diagnostics field should not be modified by smoothing."""

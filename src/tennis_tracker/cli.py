@@ -78,8 +78,8 @@ def main() -> None:
     process_parser.add_argument(
         "--ball-motion-threshold",
         type=float,
-        default=5.0,
-        help="Minimum local frame-difference score required to accept a ball",
+        default=2.0,
+        help="Minimum camera-compensated frame-difference score required to accept a ball",
     )
     process_parser.add_argument(
         "--ball-max-jump-px",
@@ -92,6 +92,12 @@ def main() -> None:
         type=float,
         default=2.0,
         help="Minimum movement needed to confirm initial ball acquisition",
+    )
+    process_parser.add_argument(
+        "--ball-max-missing-frames",
+        type=int,
+        default=5,
+        help="Consecutive missed frames before resetting ball track for re-acquisition",
     )
     process_parser.add_argument(
         "--flip-court-x",
@@ -118,8 +124,14 @@ def main() -> None:
     process_parser.add_argument(
         "--player-court-margin-m",
         type=float,
-        default=1.0,
-        help="Allowed player distance outside the doubles court before filtering",
+        default=1.5,
+        help="Allowed player lateral distance outside the doubles sidelines before filtering",
+    )
+    process_parser.add_argument(
+        "--player-baseline-margin-m",
+        type=float,
+        default=5.0,
+        help="Allowed player depth behind the baselines before filtering",
     )
     process_parser.add_argument(
         "--ball-projection-anchor",
@@ -132,6 +144,22 @@ def main() -> None:
         choices=["singles", "doubles"],
         default="doubles",
         help="Court width used by the side 2D top-view panel",
+    )
+    process_parser.add_argument(
+        "--static-homography",
+        action="store_true",
+        help="Estimate court homography once on frame 0 instead of tracking every frame",
+    )
+    process_parser.add_argument(
+        "--disable-ball-parallax-correction",
+        action="store_true",
+        help="Disable hybrid bounce/hit-anchored 3D ball height correction on smoothed output",
+    )
+    process_parser.add_argument(
+        "--3d-court-view",
+        dest="show_3d_view",
+        action="store_true",
+        help="Add a side-by-side 3D corner court view panel beside the 2D top view",
     )
 
     # --- train-ball ---
@@ -256,13 +284,18 @@ def _handle_process(args: argparse.Namespace) -> None:
         ball_motion_threshold=args.ball_motion_threshold,
         ball_max_jump_px=args.ball_max_jump_px,
         ball_min_initial_displacement_px=args.ball_min_initial_displacement_px,
+        ball_max_missing_frames=args.ball_max_missing_frames,
         flip_court_x=args.flip_court_x,
         flip_court_y=args.flip_court_y,
         court_x_scale=args.court_x_scale,
         court_y_scale=args.court_y_scale,
         player_court_margin_m=args.player_court_margin_m,
+        player_baseline_margin_m=args.player_baseline_margin_m,
         ball_projection_anchor=args.ball_projection_anchor,
         top_view_court=args.top_view_court,
+        homography_every_frame=not args.static_homography,
+        correct_ball_parallax=not args.disable_ball_parallax_correction,
+        show_3d_view=args.show_3d_view,
     )
 
     print(f"  Processed {summary['raw_row_count']} frames")

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, Optional, Sequence
 
 import cv2
 import numpy as np
@@ -49,8 +49,30 @@ _DEFAULT_TARGET_HEIGHT: int = 540
 _DEFAULT_PANEL_WIDTH: int = 300
 """Width of the top-view court panel in pixels."""
 
+_DEFAULT_PANEL_3D_WIDTH: int = 360
+"""Width of the 3D corner-view court panel in pixels."""
+
 _DEFAULT_BALL_TRAIL_LENGTH: int = 15
 """Number of recent ball positions to draw as a trail."""
+
+_NET_HEIGHT_POST_M: float = 1.07
+_NET_HEIGHT_CENTER_M: float = 0.914
+_NET_POST_OFFSET_M: float = 0.914
+_PLAYER_HEIGHT_M: float = 1.80
+_COLOR_3D_SURROUND: tuple[int, int, int] = (45, 85, 45)
+_COLOR_3D_COURT: tuple[int, int, int] = (145, 95, 55)     # Hard-court blue (BGR)
+_COLOR_3D_SHADOW: tuple[int, int, int] = (25, 25, 25)
+_COLOR_3D_DROP_LINE: tuple[int, int, int] = (120, 180, 180)
+
+
+_DEFAULT_PANEL_RUNOFF_X_M: float = 2.0
+"""Extra horizontal run-off margin (meters per side) shown on the 2D court panel."""
+
+_DEFAULT_PANEL_RUNOFF_Y_M: float = 5.5
+"""Extra baseline run-off margin (meters per end) shown on the 2D court panel."""
+
+_DEFAULT_TRAIL_MAX_MISSING_FRAMES: int = 5
+"""Consecutive missing frames before the ball trail is cleared completely."""
 
 
 # ── Panel helper: court-meter → panel-pixel ────────────────────────────
@@ -63,16 +85,19 @@ def _court_to_panel(
     panel_height: int,
     court_width_m: float = DOUBLES_WIDTH,
     padding_px: int = 20,
+    runoff_x_m: float = _DEFAULT_PANEL_RUNOFF_X_M,
+    runoff_y_m: float = _DEFAULT_PANEL_RUNOFF_Y_M,
 ) -> tuple[int, int]:
     """Convert court-meter coordinates to panel pixel coordinates.
 
     The panel Y-axis is inverted so that +Y (far baseline) goes upward,
-    matching typical top-down orientation.
+    matching typical top-down orientation. Includes baseline and sideline
+    run-off margins so players standing behind the baseline remain visible.
     """
     drawable_width = max(1, panel_width - 2 * padding_px)
     drawable_height = max(1, panel_height - 2 * padding_px)
-    scale_x = drawable_width / court_width_m
-    scale_y = drawable_height / DOUBLES_LENGTH
+    scale_x = drawable_width / (court_width_m + 2.0 * runoff_x_m)
+    scale_y = drawable_height / (DOUBLES_LENGTH + 2.0 * runoff_y_m)
     # Use a uniform scale to preserve aspect ratio
     scale = min(scale_x, scale_y)
     cx = panel_width / 2.0
@@ -228,6 +253,225 @@ def _draw_court_panel(
         cv2.circle(panel, (b_px, b_py), 4, _COLOR_BALL_MARKER, -1)
 
 
+# ── 3D corner-view projection & drawing ────────────────────────────────
+
+
+def _build_3d_corner_camera(
+    panel_width: int,
+    panel_height: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(camera_pos, R_world_to_cam, K)`` for an elevated 3D corner view."""
+    cam_pos = np.array([21.0, -27.0, 15.5], dtype=np.float64)
+    target = np.array([0.0, -1.0, 0.5], dtype=np.float64)
+    world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    forward = target - cam_pos
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, world_up)
+    right /= np.linalg.norm(right)
+    down = np.cross(forward, right)
+
+    R = np.vstack([right, down, forward])
+    f_px = min(panel_width, panel_height) * 1.25
+    K = np.array(
+        [
+            [f_px, 0.0, panel_width * 0.50],
+            [0.0, f_px, panel_height * 0.53],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return cam_pos, R, K
+
+
+def _project_3d_to_panel(
+    x_m: float,
+    y_m: float,
+    z_m: float,
+    panel_width: int,
+    panel_height: int,
+    *,
+    camera: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
+) -> tuple[int, int]:
+    """Project a 3D court point ``(x_m, y_m, z_m)`` into 3D corner-panel pixels."""
+    cam_pos, R, K = camera if camera is not None else _build_3d_corner_camera(
+        panel_width, panel_height
+    )
+    pt_cam = R @ (np.array([x_m, y_m, z_m], dtype=np.float64) - cam_pos)
+    depth = max(float(pt_cam[2]), 1e-3)
+    uvw = K @ (pt_cam / depth)
+    return int(round(float(uvw[0]))), int(round(float(uvw[1])))
+
+
+def _draw_court_3d_panel(
+    panel: np.ndarray,
+    output_row: Optional[OutputRow],
+    *,
+    ball_z_m: Optional[float] = None,
+    ball_trail_3d: Sequence[tuple[float, float, float]] = (),
+    panel_width: int,
+    panel_height: int,
+    court_view: str = "doubles",
+) -> None:
+    """Draw a 3D corner perspective court view with net, players, and 3D ball arc.
+
+    Mutates *panel* in place.
+    """
+    camera = _build_3d_corner_camera(panel_width, panel_height)
+
+    def _p3(x_m: float, y_m: float, z_m: float = 0.0) -> tuple[int, int]:
+        return _project_3d_to_panel(
+            x_m, y_m, z_m, panel_width, panel_height, camera=camera
+        )
+
+    active_width = SINGLES_WIDTH if court_view == "singles" else DOUBLES_WIDTH
+    active_half = active_width / 2.0
+    singles_half = SINGLES_WIDTH / 2.0
+    half_len = DOUBLES_LENGTH / 2.0
+
+    # ── Surround apron (run-off area) ──
+    surround_poly = np.array(
+        [
+            _p3(-active_half - 2.5, -half_len - 5.0),
+            _p3(active_half + 2.5, -half_len - 5.0),
+            _p3(active_half + 2.5, half_len + 5.0),
+            _p3(-active_half - 2.5, half_len + 5.0),
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillConvexPoly(panel, surround_poly, _COLOR_3D_SURROUND)
+
+    # ── Playable court surface ──
+    court_poly = np.array(
+        [
+            _p3(-active_half, -half_len),
+            _p3(active_half, -half_len),
+            _p3(active_half, half_len),
+            _p3(-active_half, half_len),
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillConvexPoly(panel, court_poly, _COLOR_3D_COURT)
+
+    # ── Court lines (z = 0) ──
+    court_segments = [
+        ((-active_half, -half_len), (active_half, -half_len)),
+        ((-active_half, half_len), (active_half, half_len)),
+        ((-active_half, -half_len), (-active_half, half_len)),
+        ((active_half, -half_len), (active_half, half_len)),
+        ((-singles_half, -SERVICE_LINE_DISTANCE), (singles_half, -SERVICE_LINE_DISTANCE)),
+        ((-singles_half, SERVICE_LINE_DISTANCE), (singles_half, SERVICE_LINE_DISTANCE)),
+        ((0.0, -SERVICE_LINE_DISTANCE), (0.0, SERVICE_LINE_DISTANCE)),
+        ((0.0, -half_len), (0.0, -half_len + 0.35)),
+        ((0.0, half_len - 0.35), (0.0, half_len)),
+    ]
+    if court_view != "singles":
+        court_segments.extend([
+            ((-singles_half, -half_len), (-singles_half, half_len)),
+            ((singles_half, -half_len), (singles_half, half_len)),
+        ])
+    for (x1, y1), (x2, y2) in court_segments:
+        cv2.line(panel, _p3(x1, y1, 0.0), _p3(x2, y2, 0.0), _COLOR_COURT_LINE, 1, cv2.LINE_AA)
+
+    # ── 3D Net (posts + sagging top tape + mesh lines) ──
+    net_half = active_half + _NET_POST_OFFSET_M
+    # Ground shadow line under net
+    cv2.line(panel, _p3(-net_half, 0.0, 0.0), _p3(net_half, 0.0, 0.0), _COLOR_3D_SHADOW, 1)
+    # Net mesh verticals
+    for frac in np.linspace(-1.0, 1.0, 13):
+        nx = float(frac * net_half)
+        nz = _NET_HEIGHT_CENTER_M + (_NET_HEIGHT_POST_M - _NET_HEIGHT_CENTER_M) * (frac**2)
+        cv2.line(panel, _p3(nx, 0.0, 0.0), _p3(nx, 0.0, nz), (130, 130, 130), 1)
+    # Net mid-horizontal cable + white top tape
+    net_xs = np.linspace(-net_half, net_half, 17)
+    top_pts = [
+        _p3(
+            float(nx),
+            0.0,
+            _NET_HEIGHT_CENTER_M
+            + (_NET_HEIGHT_POST_M - _NET_HEIGHT_CENTER_M) * ((nx / net_half) ** 2),
+        )
+        for nx in net_xs
+    ]
+    mid_pts = [_p3(float(nx), 0.0, 0.45) for nx in net_xs]
+    cv2.polylines(panel, [np.array(mid_pts, dtype=np.int32)], False, (140, 140, 140), 1)
+    cv2.polylines(
+        panel, [np.array(top_pts, dtype=np.int32)], False, _COLOR_COURT_LINE, 2, cv2.LINE_AA
+    )
+    # Net posts
+    for side in (-1.0, 1.0):
+        cv2.line(
+            panel,
+            _p3(side * net_half, 0.0, 0.0),
+            _p3(side * net_half, 0.0, _NET_HEIGHT_POST_M),
+            (220, 220, 220),
+            2,
+        )
+
+    # ── 3D Ball trail (ground shadows + airborne arc) ──
+    if ball_trail_3d:
+        prev_air: Optional[tuple[int, int]] = None
+        for i, (bx, by, bz) in enumerate(ball_trail_3d):
+            alpha = (i + 1) / len(ball_trail_3d)
+            g_pt = _p3(bx, by, 0.0)
+            a_pt = _p3(bx, by, max(0.0, bz))
+            cv2.circle(panel, g_pt, 2, _COLOR_3D_SHADOW, -1)
+            trail_bgr = tuple(int(c * alpha) for c in _COLOR_BALL_TRAIL)
+            if prev_air is not None:
+                cv2.line(panel, prev_air, a_pt, trail_bgr, max(1, int(2 * alpha)), cv2.LINE_AA)
+            cv2.circle(panel, a_pt, max(2, int(4 * alpha)), trail_bgr, -1)
+            prev_air = a_pt
+
+    # ── Players as 3D vertical pins (foot shadow -> head) ──
+    if output_row is not None:
+        for label, px_m, py_m, color in (
+            ("A", output_row.player_a_x_m, output_row.player_a_y_m, _COLOR_PLAYER_A),
+            ("B", output_row.player_b_x_m, output_row.player_b_y_m, _COLOR_PLAYER_B),
+        ):
+            if px_m is not None and py_m is not None:
+                foot = _p3(px_m, py_m, 0.0)
+                head = _p3(px_m, py_m, _PLAYER_HEIGHT_M)
+                cv2.circle(panel, foot, 4, _COLOR_3D_SHADOW, -1)
+                cv2.line(panel, foot, head, color, 2, cv2.LINE_AA)
+                cv2.circle(panel, head, 5, color, -1)
+                cv2.putText(
+                    panel, label, (head[0] + 6, head[1] + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA,
+                )
+
+        # ── Current 3D ball + vertical height drop-line ──
+        if output_row.ball_x_m is not None and output_row.ball_y_m is not None:
+            bz = max(0.0, ball_z_m) if ball_z_m is not None else 0.0
+            g_pt = _p3(output_row.ball_x_m, output_row.ball_y_m, 0.0)
+            a_pt = _p3(output_row.ball_x_m, output_row.ball_y_m, bz)
+            cv2.circle(panel, g_pt, 3, _COLOR_3D_SHADOW, -1)
+            if bz > 0.05:
+                cv2.line(panel, g_pt, a_pt, _COLOR_3D_DROP_LINE, 1, cv2.LINE_AA)
+            cv2.circle(panel, a_pt, 5, _COLOR_BALL_MARKER, -1)
+            cv2.putText(
+                panel,
+                f"z={bz:.1f}m",
+                (10, panel_height - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                _COLOR_BALL_MARKER,
+                1,
+                cv2.LINE_AA,
+            )
+
+    # ── Panel header ──
+    cv2.putText(
+        panel,
+        "3D Corner View",
+        (10, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        _COLOR_FRAME_NUM,
+        1,
+        cv2.LINE_AA,
+    )
+
+
 # ── Source frame overlay ──────────────────────────────────────────────
 
 
@@ -367,39 +611,21 @@ def render_annotated_frames(
     panel_width: int = _DEFAULT_PANEL_WIDTH,
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
     court_view: str = "doubles",
+    show_3d_view: bool = False,
+    panel_3d_width: int = _DEFAULT_PANEL_3D_WIDTH,
+    ball_heights_m: Optional[Sequence[Optional[float]]] = None,
 ) -> Iterator[tuple[int, np.ndarray]]:
     """Yield annotated frames from a video and tracking output rows.
 
-    For each frame in the video, this yields an annotated frame
-    consisting of the resized source frame with overlays on the left
-    and a top-view court panel on the right.
-
-    Parameters
-    ----------
-    video_path:
-        Path to the source video.
-    output_rows:
-        Tracking output rows for annotation.  Should have one row per
-        video frame.  If fewer rows, remaining frames get a "no data"
-        overlay.
-    target_height:
-        Height in pixels for the output frame (the source is resized
-        to this height, maintaining aspect ratio).
-    panel_width:
-        Width of the top-view court panel in pixels.
-    ball_trail_length:
-        Number of recent ball positions to draw as a fading trail.
-    court_view:
-        ``"singles"`` draws/scales the active singles court. ``"doubles"``
-        draws/scales the full doubles court.
-
-    Yields
-    ------
-    (frame_index, annotated_bgr_frame) tuples.
+    For each frame in the video, this yields an annotated frame consisting of
+    the resized source frame with overlays on the left, a top-view 2D court
+    panel beside it, and optionally a 3D corner-view court panel on the right.
     """
     # ── Ball trail buffer ──
     ball_trail_pixels: list[tuple[float, float]] = []
     ball_trail_meters: list[tuple[float, float]] = []
+    ball_trail_3d: list[tuple[float, float, float]] = []
+    ball_missing_streak = 0
 
     total_rows = len(output_rows)
 
@@ -421,20 +647,52 @@ def render_annotated_frames(
             if raw_output_row is not None
             else None
         )
+        ball_z = (
+            ball_heights_m[idx]
+            if ball_heights_m is not None and idx < len(ball_heights_m)
+            else None
+        )
 
-        # ── Update ball trail ──
-        if output_row is not None:
-            if (
-                output_row.ball_pixel_x is not None
-                and output_row.ball_pixel_y is not None
-            ):
+        # ── Update ball trail (decay and clear during missing streaks) ──
+        has_ball_px = (
+            output_row is not None
+            and output_row.ball_pixel_x is not None
+            and output_row.ball_pixel_y is not None
+        )
+        has_ball_m = (
+            output_row is not None
+            and output_row.ball_x_m is not None
+            and output_row.ball_y_m is not None
+        )
+        if has_ball_px or has_ball_m:
+            ball_missing_streak = 0
+            if has_ball_px and output_row is not None:
+                assert output_row.ball_pixel_x is not None and output_row.ball_pixel_y is not None
                 ball_trail_pixels.append((output_row.ball_pixel_x, output_row.ball_pixel_y))
                 if len(ball_trail_pixels) > ball_trail_length:
                     ball_trail_pixels.pop(0)
-            if output_row.ball_x_m is not None and output_row.ball_y_m is not None:
+            if has_ball_m and output_row is not None:
+                assert output_row.ball_x_m is not None and output_row.ball_y_m is not None
                 ball_trail_meters.append((output_row.ball_x_m, output_row.ball_y_m))
                 if len(ball_trail_meters) > ball_trail_length:
                     ball_trail_meters.pop(0)
+                z_val = ball_z if ball_z is not None else 0.0
+                ball_trail_3d.append((output_row.ball_x_m, output_row.ball_y_m, z_val))
+                if len(ball_trail_3d) > ball_trail_length:
+                    ball_trail_3d.pop(0)
+        else:
+            ball_missing_streak += 1
+            if ball_missing_streak > _DEFAULT_TRAIL_MAX_MISSING_FRAMES:
+                ball_trail_pixels.clear()
+                ball_trail_meters.clear()
+                ball_trail_3d.clear()
+            else:
+                if ball_trail_pixels:
+                    ball_trail_pixels.pop(0)
+                if ball_trail_meters:
+                    ball_trail_meters.pop(0)
+                if ball_trail_3d:
+                    ball_trail_3d.pop(0)
 
         # ── Draw source overlay ──
         diag_text = output_row.diagnostics if output_row and output_row.diagnostics else None
@@ -447,7 +705,7 @@ def render_annotated_frames(
             diagnostics_text=diag_text,
         )
 
-        # ── Create and draw court panel ──
+        # ── Create and draw 2D top-view court panel ──
         panel = np.zeros((target_height, panel_width, 3), dtype=np.uint8)
         _draw_court_panel(
             panel,
@@ -458,8 +716,21 @@ def render_annotated_frames(
             court_view=court_view,
         )
 
-        # ── Combine ──
-        annotated = np.concatenate([resized, panel], axis=1)
+        # ── Combine side-by-side panels ──
+        if show_3d_view:
+            panel_3d = np.zeros((target_height, panel_3d_width, 3), dtype=np.uint8)
+            _draw_court_3d_panel(
+                panel_3d,
+                output_row,
+                ball_z_m=ball_z,
+                ball_trail_3d=ball_trail_3d,
+                panel_width=panel_3d_width,
+                panel_height=target_height,
+                court_view=court_view,
+            )
+            annotated = np.concatenate([resized, panel, panel_3d], axis=1)
+        else:
+            annotated = np.concatenate([resized, panel], axis=1)
 
         yield (frame_index, annotated)
 
@@ -474,35 +745,14 @@ def render_annotated_video(
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
     fps: Optional[float] = None,
     court_view: str = "doubles",
+    show_3d_view: bool = False,
+    panel_3d_width: int = _DEFAULT_PANEL_3D_WIDTH,
+    ball_heights_m: Optional[Sequence[Optional[float]]] = None,
 ) -> AnnotatedVideoResult:
     """Render an annotated video file from source + tracking data.
 
-    Writes an MP4 video combining resized source frames with overlays
-    and a top-view court panel.
-
-    Parameters
-    ----------
-    video_path:
-        Source video path.
-    output_rows:
-        Tracking output rows (one per frame to process).
-    output_video_path:
-        Destination for the annotated MP4.
-    target_height:
-        Height of the annotated output in pixels.
-    panel_width:
-        Width of the top-view court panel in pixels.
-    ball_trail_length:
-        Trail length for ball markers.
-    fps:
-        Output video FPS.  If None, reads from source video metadata.
-    court_view:
-        ``"singles"`` draws/scales the active singles court. ``"doubles"``
-        draws/scales the full doubles court.
-
-    Returns
-    -------
-    AnnotatedVideoResult with frame count and output dimensions.
+    Writes an MP4 video combining resized source frames with overlays,
+    a 2D top-view court panel, and optionally a 3D corner-view court panel.
     """
     # ── Determine FPS ──
     if fps is None:
@@ -512,28 +762,33 @@ def render_annotated_video(
         except (FileNotFoundError, ValueError):
             fps = 30.0
 
-    # ── Generate annotated frames ──
-    frames: list[np.ndarray] = []
-    for _, annotated in render_annotated_frames(
-        video_path,
-        output_rows,
-        target_height=target_height,
-        panel_width=panel_width,
-        ball_trail_length=ball_trail_length,
-        court_view=court_view,
-    ):
-        frames.append(annotated)
+    # ── Stream annotated frames directly to video writer (constant RAM) ──
+    frame_count = 0
+    oh = 0
+    ow = 0
 
-    # ── Write video ──
-    write_video(frames, output_video_path, fps=fps)
+    def _frame_stream() -> Iterator[np.ndarray]:
+        nonlocal frame_count, oh, ow
+        for _, annotated in render_annotated_frames(
+            video_path,
+            output_rows,
+            target_height=target_height,
+            panel_width=panel_width,
+            ball_trail_length=ball_trail_length,
+            court_view=court_view,
+            show_3d_view=show_3d_view,
+            panel_3d_width=panel_3d_width,
+            ball_heights_m=ball_heights_m,
+        ):
+            if frame_count == 0:
+                oh, ow = annotated.shape[:2]
+            frame_count += 1
+            yield annotated
 
-    if frames:
-        oh, ow = frames[0].shape[:2]
-    else:
-        oh, ow = 0, 0
+    write_video(_frame_stream(), output_video_path, fps=fps)
 
     return AnnotatedVideoResult(
-        frame_count=len(frames),
+        frame_count=frame_count,
         output_path=str(output_video_path),
         output_width=ow,
         output_height=oh,

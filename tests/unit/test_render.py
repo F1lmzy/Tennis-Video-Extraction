@@ -10,11 +10,13 @@ import pytest
 from tennis_tracker.court import DOUBLES_LENGTH, DOUBLES_WIDTH
 from tennis_tracker.render import (
     _court_to_panel,
-    render_annotated_frames,
-    render_annotated_video,
+    _draw_court_3d_panel,
     _draw_court_panel,
     _draw_source_overlay,
+    _project_3d_to_panel,
     _scale_row_pixels,
+    render_annotated_frames,
+    render_annotated_video,
 )
 from tennis_tracker.types import OutputRow
 from tennis_tracker.video import write_video, read_video_metadata
@@ -103,6 +105,14 @@ class TestCourtToPanelMapping:
             px, py = _court_to_panel(x_m, y_m, pw, ph)
             assert 0 <= px <= pw, f"Corner ({x_m}, {y_m}) px={px} out of panel width"
             assert 0 <= py <= ph, f"Corner ({x_m}, {y_m}) py={py} out of panel height"
+
+    def test_behind_baseline_player_stays_within_panel(self) -> None:
+        """Players standing up to 5m behind the baseline should remain visible."""
+        pw, ph = 300, 540
+        for y_m in (-16.5, 16.5):
+            px, py = _court_to_panel(0.0, y_m, pw, ph)
+            assert 0 <= px < pw
+            assert 0 <= py < ph
 
 
 # ─── Court panel drawing ──────────────────────────────────────────────
@@ -483,3 +493,44 @@ class TestRenderAnnotatedVideo:
         assert meta.height == 360
         # Width should be >= 200 (panel) + any portion of the source
         assert meta.width >= 200
+
+    def test_3d_corner_view_adds_side_panel_and_elevation(
+        self, short_video: Path, tmp_path: Path
+    ) -> None:
+        """Enabling show_3d_view appends the 3D corner panel beside the 2D panel."""
+        # Higher Z must project higher (smaller pixel Y) in the 3D corner view
+        _, y_ground = _project_3d_to_panel(0.0, 0.0, 0.0, 360, 540)
+        _, y_air = _project_3d_to_panel(0.0, 0.0, 2.0, 360, 540)
+        assert y_air < y_ground
+
+        # Direct 3D panel rendering produces visible court, net, players, and ball
+        panel_3d = np.zeros((360, 240, 3), dtype=np.uint8)
+        _draw_court_3d_panel(
+            panel_3d,
+            _make_output_row(0),
+            ball_z_m=1.5,
+            ball_trail_3d=[(0.0, -2.0, 0.5), (0.3, 0.0, 1.8), (0.5, 1.0, 1.5)],
+            panel_width=240,
+            panel_height=360,
+        )
+        assert np.any(panel_3d > 0)
+
+        rows = [_make_output_row(i) for i in range(5)]
+        out_2d = tmp_path / "annotated_2d.mp4"
+        out_3d = tmp_path / "annotated_3d.mp4"
+        res_2d = render_annotated_video(
+            short_video, rows, out_2d, target_height=240, panel_width=150, show_3d_view=False
+        )
+        res_3d = render_annotated_video(
+            short_video,
+            rows,
+            out_3d,
+            target_height=240,
+            panel_width=150,
+            show_3d_view=True,
+            panel_3d_width=220,
+            ball_heights_m=[0.0, 0.8, 1.5, 1.1, 0.2],
+        )
+        assert res_3d.output_width == res_2d.output_width + 220
+        assert res_3d.output_height == res_2d.output_height
+        assert res_3d.frame_count == 5

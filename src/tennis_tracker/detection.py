@@ -21,6 +21,9 @@ from tennis_tracker.types import PixelPoint
 COCO_PERSON_CLASS_ID: int = 0
 """COCO class ID for ``person``."""
 
+COCO_TENNIS_RACKET_CLASS_ID: int = 38
+"""COCO class ID for ``tennis racket``."""
+
 ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS: dict[int, str] = {
     0: "doubles_near_left",
     1: "singles_near_left",
@@ -140,6 +143,7 @@ class PlayerDetector:
             self._model = YOLO(str(model_path))
         else:
             self._model = YOLO("yolo26n.pt")
+        self.last_racket_boxes: list[BoundingBox] = []
 
     @property
     def model(self) -> YOLO:
@@ -168,7 +172,8 @@ class PlayerDetector:
             Detections filtered to the COCO ``person`` class, sorted by
             decreasing confidence.
         """
-        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        self.last_racket_boxes = []
+        predict_kwargs = {"conf": min(conf_threshold, 0.15), "verbose": False}
         if imgsz is not None:
             predict_kwargs["imgsz"] = imgsz
         if device is not None:
@@ -184,23 +189,28 @@ class PlayerDetector:
         detections: list[PlayerDetection] = []
         for i in range(len(boxes)):
             cls_id = int(boxes.cls[i].item())
+            conf = float(boxes.conf[i].item())
+            xyxy = boxes.xyxy[i].tolist()
+            bbox = BoundingBox(x1=xyxy[0], y1=xyxy[1], x2=xyxy[2], y2=xyxy[3])
+
+            if cls_id == COCO_TENNIS_RACKET_CLASS_ID:
+                if conf >= 0.15:
+                    self.last_racket_boxes.append(bbox)
+                continue
+
             if cls_id != COCO_PERSON_CLASS_ID:
                 continue
 
-            conf = float(boxes.conf[i].item())
             # Post-filter by confidence as a belt-and-suspenders check; this
             # also ensures mock models that ignore the ``conf`` parameter
             # produce testable results.
             if conf < conf_threshold:
                 continue
 
-            xyxy = boxes.xyxy[i].tolist()
-
             track_id: Optional[int] = None
             if boxes.id is not None:
                 track_id = int(boxes.id[i].item())
 
-            bbox = BoundingBox(x1=xyxy[0], y1=xyxy[1], x2=xyxy[2], y2=xyxy[3])
             detections.append(PlayerDetection(bbox=bbox, confidence=conf, track_id=track_id))
 
         # Sort descending by confidence (most confident first)

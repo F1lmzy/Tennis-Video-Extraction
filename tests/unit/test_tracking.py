@@ -10,7 +10,14 @@ import numpy as np
 import pytest
 
 from tennis_tracker.detection import BallDetection, BoundingBox, PlayerDetection
-from tennis_tracker.tracking import PlayerTracker, has_local_ball_motion, select_best_ball
+from tennis_tracker.tracking import (
+    PlayerTracker,
+    filter_static_ball_hotspots,
+    find_static_ball_hotspots,
+    has_local_ball_motion,
+    refine_ball_sequence,
+    select_best_ball,
+)
 from tennis_tracker.types import PixelPoint
 
 
@@ -242,6 +249,71 @@ class TestPlayerTrackerContinuity:
         assert result.player_a is None
         assert result.player_b is None
 
+    def test_reacquires_player_b_after_single_player_start(self) -> None:
+        """Starting with 1 player must still acquire player B when 2 appear."""
+        tracker = PlayerTracker()
+        f1 = tracker.update([_player(10, 0, 20, 20, confidence=0.9)])
+        assert f1.player_a is not None
+        assert f1.player_b is None
+
+        f2 = tracker.update([
+            _player(12, 0, 22, 20, confidence=0.9),
+            _player(200, 0, 210, 20, confidence=0.85),
+        ])
+        assert f2.player_a is not None
+        assert f2.player_b is not None
+        assert f2.player_a.bbox.bottom_center.x == pytest.approx(17.0)
+        assert f2.player_b.bbox.bottom_center.x == pytest.approx(205.0)
+
+    def test_reacquires_player_b_after_long_absence(self) -> None:
+        """Player B should be re-acquired even after expiring from state."""
+        tracker = PlayerTracker(max_missing_frames=3)
+        tracker.update([
+            _player(10, 0, 20, 20, confidence=0.9),
+            _player(200, 0, 210, 20, confidence=0.85),
+        ])
+        for _ in range(4):
+            f_miss = tracker.update([_player(12, 0, 22, 20, confidence=0.9)])
+            assert f_miss.player_a is not None
+            assert f_miss.player_b is None
+
+        f_back = tracker.update([
+            _player(14, 0, 24, 20, confidence=0.9),
+            _player(500, 0, 510, 20, confidence=0.85),
+        ])
+        assert f_back.player_a is not None
+        assert f_back.player_b is not None
+        assert f_back.player_a.bbox.bottom_center.x == pytest.approx(19.0)
+        assert f_back.player_b.bbox.bottom_center.x == pytest.approx(505.0)
+
+    def test_single_detection_matches_closest_track_b(self) -> None:
+        """When only player B remains visible, keep label B instead of swapping to A."""
+        tracker = PlayerTracker()
+        tracker.update([
+            _player(10, 0, 20, 20, confidence=0.9),
+            _player(300, 0, 310, 20, confidence=0.85),
+        ])
+        f2 = tracker.update([_player(304, 0, 314, 20, confidence=0.88)])
+        assert f2.player_a is None
+        assert f2.player_b is not None
+        assert f2.player_b.bbox.bottom_center.x == pytest.approx(309.0)
+        assert f2.diagnostics.has_flag("missing_player_a")
+
+    def test_one_missing_player_does_not_drop_both_tracks(self) -> None:
+        """If only one track has a nearby match among >=2 detections, keep that track."""
+        tracker = PlayerTracker(max_match_distance=50.0)
+        tracker.update([
+            _player(10, 0, 20, 20, confidence=0.9),
+            _player(100, 0, 110, 20, confidence=0.85),
+        ])
+        f2 = tracker.update([
+            _player(14, 0, 24, 20, confidence=0.9),
+            _player(400, 0, 410, 20, confidence=0.95),
+        ])
+        assert f2.player_a is not None
+        assert f2.player_a.bbox.bottom_center.x == pytest.approx(19.0)
+        assert f2.player_b is None
+
 
 class TestPlayerTrackerDiagnostics:
     """Tests for confidence-based diagnostics."""
@@ -457,6 +529,27 @@ class TestSelectBestBall:
         assert not has_local_ball_motion(static_line, previous, current)
         assert has_local_ball_motion(moving_ball, previous, current)
 
+    def test_camera_transform_cancels_panned_static_artifact(self) -> None:
+        """A static logo shifted by camera pan should be rejected with camera_transform."""
+        previous = np.zeros((100, 100, 3), dtype=np.uint8)
+        current = np.zeros((100, 100, 3), dtype=np.uint8)
+        # Static white dot shifts +4px in X due to camera pan
+        previous[20:25, 20:25] = 255
+        current[20:25, 24:29] = 255
+
+        panned_logo = _ball(26, 22, confidence=0.8)
+        # Without camera compensation, pixel diff sees apparent motion
+        assert has_local_ball_motion(panned_logo, previous, current, min_motion_score=5.0)
+        # Transform mapping current -> previous shifts X by -4
+        cam_tx = np.array([[1.0, 0.0, -4.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+        assert not has_local_ball_motion(
+            panned_logo,
+            previous,
+            current,
+            min_motion_score=5.0,
+            camera_transform=cam_tx,
+        )
+
     def test_returns_none_instead_of_static_line_when_track_exists(self) -> None:
         previous = np.zeros((100, 100, 3), dtype=np.uint8)
         current = previous.copy()
@@ -490,3 +583,96 @@ class TestSelectBestBall:
         )
 
         assert best is None
+
+    def test_velocity_prediction_and_racket_penalty_prefer_departing_ball(self) -> None:
+        """A departing open-air ball beats a lingering racket detection."""
+        previous = np.zeros((700, 800, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[547:553, 637:643] = 255  # real ball
+        current[582:588, 671:677] = 255  # follow-through racket
+
+        real_ball = _ball(640, 549, confidence=0.55)
+        racket_fp = _ball(674, 585, confidence=0.55)
+        prev_ball = _ball(625, 595, confidence=0.48)
+        predicted = PixelPoint(x=644.0, y=539.0)
+        racket_box = BoundingBox(x1=660.0, y1=570.0, x2=690.0, y2=605.0)
+
+        best = select_best_ball(
+            [racket_fp, real_ball],
+            previous_frame=previous,
+            current_frame=current,
+            previous_ball=prev_ball,
+            predicted_ball_center=predicted,
+            racket_boxes=[racket_box],
+        )
+
+        assert best is real_ball
+
+    def test_refine_ball_sequence_swaps_racket_detour_for_collinear_ball(self) -> None:
+        """Bidirectional refinement fixes both mid-flight and start-of-run racket swaps."""
+        # Scenario matching f=238..240 (racket detour at t=1)
+        b0 = _ball(625, 595, confidence=0.48)
+        racket_1 = _ball(674, 585, confidence=0.53)
+        real_1 = _ball(640, 549, confidence=0.55)
+        b2 = _ball(654, 507, confidence=0.54)
+
+        refined = refine_ball_sequence(
+            [b0, racket_1, b2],
+            [[b0], [racket_1, real_1], [b2]],
+        )
+        assert refined[1] is real_1
+
+        # Scenario matching f=151..154 (start-of-run racket at t=1, real ball at t=1)
+        racket_start = _ball(1171, 656, confidence=0.20)
+        real_start = _ball(1178, 564, confidence=0.63)
+        b_next1 = _ball(1149, 524, confidence=0.67)
+        b_next2 = _ball(1120, 484, confidence=0.70)
+
+        refined2 = refine_ball_sequence(
+            [None, racket_start, b_next1, b_next2],
+            [[], [racket_start, real_start], [b_next1], [b_next2]],
+        )
+        assert refined2[1] is real_start
+
+    def test_refine_ball_sequence_prunes_isolated_kink_but_keeps_bounce(self) -> None:
+        """Isolated 1-frame sideways spike is dropped; real bounce reversal is preserved."""
+        # Smooth flight with 1-frame 80px sideways racket spike at t=2
+        s0 = _ball(100, 100)
+        s1 = _ball(120, 120)
+        spike = _ball(210, 110)  # 70px off midpoint (140, 140)
+        s3 = _ball(160, 160)
+        s4 = _ball(180, 180)
+        refined = refine_ball_sequence(
+            [s0, s1, spike, s3, s4], [[x] for x in (s0, s1, spike, s3, s4)]
+        )
+        assert refined[2] is None
+
+        # Real bounce cusp at t=2 (falling into y=320 then rising sharply)
+        f0 = _ball(100, 280)
+        f1 = _ball(110, 300)
+        bounce = _ball(120, 320)
+        f3 = _ball(130, 290)
+        f4 = _ball(140, 260)
+        refined_b = refine_ball_sequence(
+            [f0, f1, bounce, f3, f4], [[x] for x in (f0, f1, bounce, f3, f4)]
+        )
+        assert refined_b[2] is bounce
+
+    def test_static_hotspot_mask_removes_persistent_wall_logo_keeps_moving_ball(self) -> None:
+        """Repeated detections on a static logo are masked while moving balls survive."""
+        frames_dets = []
+        for f in range(30):
+            # Static wall logo drifting slightly with camera pan
+            logo = _ball(910.0 + 0.1 * f, 120.0 + 0.05 * f, confidence=0.55)
+            # Real moving ball crossing the court
+            moving = _ball(400.0 + 20.0 * f, 600.0 - 12.0 * f, confidence=0.65)
+            frames_dets.append([logo, moving])
+
+        hotspots = find_static_ball_hotspots(frames_dets, min_frame_hits=15)
+        assert len(hotspots) == 1
+        assert hotspots[0][0] == pytest.approx(911.5, abs=5.0)
+        assert hotspots[0][1] == pytest.approx(120.7, abs=5.0)
+
+        cleaned = filter_static_ball_hotspots(frames_dets[10], hotspots)
+        assert len(cleaned) == 1
+        assert cleaned[0].center.x == pytest.approx(600.0)

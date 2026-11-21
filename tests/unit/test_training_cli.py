@@ -120,6 +120,19 @@ class TestCourtTrainingCLI:
             court.build_parser().parse_args(["--help"])
         assert exc.value.code == 0
 
+    def test_ensure_valid_court_flip_idx_fixes_identity(self, tmp_path) -> None:
+        yaml_path = tmp_path / "data.yaml"
+        yaml_path.write_text(
+            "kpt_shape: [15, 3]\n"
+            "flip_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]\n",
+            encoding="utf-8",
+        )
+        assert court.ensure_valid_court_flip_idx(yaml_path) is True
+        text = yaml_path.read_text(encoding="utf-8")
+        assert "[3, 2, 1, 0, 7, 6, 5, 4, 10, 9, 8, 13, 12, 11, 14]" in text
+        # Second call is a no-op
+        assert court.ensure_valid_court_flip_idx(yaml_path) is False
+
     def test_parse_required_args(self) -> None:
         """Required args are present and parsed correctly."""
         args = court.build_parser().parse_args(

@@ -139,6 +139,32 @@ uv run python -m tennis_tracker.train_court \
 
 Both training CLIs support `--epochs`, `--imgsz`, `--batch`, and other YOLO arguments. View full options with `--help`.
 
+### Training on Google Colab GPU (`colab` CLI)
+
+If you have the Google Colab CLI (`colab`) installed and authenticated, you can train and iterate on GPU (e.g., `T4`, `L4`, `A100`) directly from this repository using `scripts/train_on_colab.py`:
+
+```bash
+# Preview the Colab workflow without allocating a VM
+uv run python scripts/train_on_colab.py --task ball --dry-run
+
+# Train ball detection on a Colab T4 GPU (recommended imgsz=1280 for small balls)
+uv run python scripts/train_on_colab.py \
+  --task ball \
+  --gpu T4 \
+  --epochs 100 \
+  --imgsz 1280 \
+  --output models/ball_yolo26.pt
+
+# Train court keypoint detection on a Colab T4 GPU
+uv run python scripts/train_on_colab.py \
+  --task court \
+  --gpu T4 \
+  --epochs 100 \
+  --output models/court_keypoints_yolo26.pt
+```
+
+The runner packages `src/`, provisions a Colab GPU session, downloads the dataset on the VM via `.env` (`ROBOFLOW_API_KEY`) or uploads `data/datasets/`, runs training on CUDA (`--device 0`), downloads the trained `.pt` weights plus `results.csv`/`args.yaml` to `runs/colab/<task>/`, and stops the session automatically. Pass `--keep-session` / `--reuse-session` to iterate across runs without recreating the VM.
+
 ## Automatic Model Optimization
 
 Before running the main pipeline, models can be automatically optimized for CPU inference:
@@ -157,6 +183,24 @@ Supported formats: `onnx`, `openvino`. Supported quantization: `int8`, `fp16`.
 When `--auto-optimize-models` is enabled (default) in the `process` command, the pipeline detects missing or stale optimized artifacts, exports and benchmarks ONNX/OpenVINO variants, and selects the fastest valid artifact. Falls back to the original `.pt` file if needed.
 
 ## Processing a Video
+
+### On Google Colab GPU (recommended for faster inference)
+
+```bash
+# Default input (data/input/match.mp4) on a Colab T4 GPU
+./scripts/process_video.sh
+
+# Custom video path and extra options (e.g. L4 GPU, side-by-side 3D corner view)
+./scripts/process_video.sh data/input/match.mp4 --3d-court-view
+./scripts/process_video.sh data/input/match.mp4 --3d --gpu L4
+
+# Dry-run without allocating a VM
+./scripts/process_video.sh data/input/match.mp4 --dry-run
+```
+
+`scripts/process_video.sh` wraps `scripts/process_on_colab.py`, which uploads the video and local models (`yolo26n.pt`, `models/ball_yolo26.pt`, `models/court_keypoints_yolo26.pt`) to a Colab GPU session, runs `tennis_tracker process --device cuda` detached while polling logs, downloads the CSVs and annotated MP4 back to `data/output/`, and stops the session automatically.
+
+### Locally (CPU / MPS)
 
 ```bash
 uv run python -m tennis_tracker process \
