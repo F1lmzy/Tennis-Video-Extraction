@@ -325,43 +325,27 @@ class TestRenderAnnotatedFrames:
         """Should yield one annotated frame per output row."""
         rows = [_make_output_row(i) for i in range(5)]
         annotated = list(
-            render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-            )
+            render_annotated_frames(short_video, rows, output_width=480)
         )
         assert len(annotated) == 5
 
-    def test_annotated_frame_has_correct_size(self, short_video: Path) -> None:
-        """Each annotated frame should include source + panel."""
+    def test_annotated_frame_is_16_by_9(self, short_video: Path) -> None:
+        """Each annotated frame should have a 16:9 aspect ratio."""
         rows = [_make_output_row(i) for i in range(5)]
         frames = list(
-            render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-            )
+            render_annotated_frames(short_video, rows, output_width=480)
         )
         for idx, frame in frames:
             h, w = frame.shape[:2]
-            assert h == 240
-            assert (
-                w > 150
-            ), f"Width {w} should be larger than panel width 150"
+            assert w == 480
+            assert h == 270
+            assert abs(w / h - 16 / 9) < 0.02
 
     def test_annotations_visible(self, short_video: Path) -> None:
         """Annotated frame should have visible overlays."""
         rows = [_make_output_row(i) for i in range(5)]
         frames = list(
-            render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-            )
+            render_annotated_frames(short_video, rows, output_width=480)
         )
         for _, frame in frames:
             assert np.any(frame > 0), "Annotated frame should have content"
@@ -374,12 +358,7 @@ class TestRenderAnnotatedFrames:
             _make_output_row(2, has_players=True, has_ball=True),
         ]
         frames = list(
-            render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-            )
+            render_annotated_frames(short_video, rows, output_width=480)
         )
         assert len(frames) == 3
         for _, frame in frames:
@@ -390,11 +369,7 @@ class TestRenderAnnotatedFrames:
         rows = [_make_output_row(i, has_ball=True) for i in range(5)]
         frames = list(
             render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-                ball_trail_length=10,
+                short_video, rows, output_width=480, ball_trail_length=10
             )
         )
         assert len(frames) == 5
@@ -406,12 +381,7 @@ class TestRenderAnnotatedFrames:
             _make_output_row(1, has_ball=True),
         ]
         frames = list(
-            render_annotated_frames(
-                short_video,
-                rows,
-                target_height=240,
-                panel_width=150,
-            )
+            render_annotated_frames(short_video, rows, output_width=480)
         )
         assert len(frames) == 2
 
@@ -432,36 +402,28 @@ class TestRenderAnnotatedVideo:
     def test_write_annotated_video(
         self, short_video: Path, tmp_path: Path
     ) -> None:
-        """Should write a valid MP4 with correct metadata."""
+        """Should write a valid 16:9 MP4 with correct metadata."""
         rows = [_make_output_row(i) for i in range(5)]
         out_path = tmp_path / "annotated.mp4"
         result = render_annotated_video(
-            short_video,
-            rows,
-            out_path,
-            target_height=240,
-            panel_width=150,
+            short_video, rows, out_path, output_width=480
         )
         assert out_path.exists()
         assert result.frame_count == 5
-        assert result.output_height == 240
+        assert result.output_width == 480
+        assert result.output_height == 270
 
-        # Re-read and verify
         meta = read_video_metadata(out_path)
         assert meta.frame_count == pytest.approx(5, abs=2)
-        assert meta.width > 150  # source + panel
+        assert meta.width == 480
+        assert meta.height == 270
 
     def test_custom_fps(self, short_video: Path, tmp_path: Path) -> None:
         """Custom FPS should be applied to output video."""
         rows = [_make_output_row(i) for i in range(5)]
         out_path = tmp_path / "annotated_custom.mp4"
         result = render_annotated_video(
-            short_video,
-            rows,
-            out_path,
-            target_height=240,
-            panel_width=150,
-            fps=15.0,
+            short_video, rows, out_path, output_width=480, fps=15.0
         )
         assert result.frame_count == 5
 
@@ -469,35 +431,27 @@ class TestRenderAnnotatedVideo:
         """Empty rows should produce result with 0 frames (nothing to annotate)."""
         out_path = tmp_path / "annotated_empty.mp4"
         result = render_annotated_video(
-            short_video,
-            [],
-            out_path,
-            target_height=240,
-            panel_width=150,
+            short_video, [], out_path, output_width=480
         )
         assert result.frame_count == 0
 
     def test_output_dimensions(self, short_video: Path, tmp_path: Path) -> None:
-        """Output width should be source_width + panel_width."""
+        """Output should be 16:9 at the requested width."""
         rows = [_make_output_row(i) for i in range(5)]
         out_path = tmp_path / "annotated_dims.mp4"
         result = render_annotated_video(
-            short_video,
-            rows,
-            out_path,
-            target_height=360,
-            panel_width=200,
+            short_video, rows, out_path, output_width=640
         )
+        assert result.output_width == 640
         assert result.output_height == 360
         meta = read_video_metadata(out_path)
         assert meta.height == 360
-        # Width should be >= 200 (panel) + any portion of the source
-        assert meta.width >= 200
+        assert meta.width == 640
 
-    def test_3d_corner_view_adds_side_panel_and_elevation(
+    def test_3d_corner_view_adds_bottom_row_and_elevation(
         self, short_video: Path, tmp_path: Path
     ) -> None:
-        """Enabling show_3d_view appends the 3D corner panel beside the 2D panel."""
+        """Enabling show_3d_view adds a full-width 3D bottom row within 16:9."""
         # Higher Z must project higher (smaller pixel Y) in the 3D corner view
         _, y_ground = _project_3d_to_panel(0.0, 0.0, 0.0, 360, 540)
         _, y_air = _project_3d_to_panel(0.0, 0.0, 2.0, 360, 540)
@@ -519,18 +473,28 @@ class TestRenderAnnotatedVideo:
         out_2d = tmp_path / "annotated_2d.mp4"
         out_3d = tmp_path / "annotated_3d.mp4"
         res_2d = render_annotated_video(
-            short_video, rows, out_2d, target_height=240, panel_width=150, show_3d_view=False
+            short_video, rows, out_2d, output_width=480, show_3d_view=False
         )
         res_3d = render_annotated_video(
             short_video,
             rows,
             out_3d,
-            target_height=240,
-            panel_width=150,
+            output_width=480,
             show_3d_view=True,
-            panel_3d_width=220,
             ball_heights_m=[0.0, 0.8, 1.5, 1.1, 0.2],
         )
-        assert res_3d.output_width == res_2d.output_width + 220
-        assert res_3d.output_height == res_2d.output_height
+        # Both layouts stay 16:9 at the same outer dimensions; the 3D view
+        # occupies a bottom row rather than widening the frame.
+        assert res_3d.output_width == res_2d.output_width == 480
+        assert res_3d.output_height == res_2d.output_height == 270
         assert res_3d.frame_count == 5
+
+        # The 3D variant must differ from the 2D variant (bottom row drawn).
+        frames_2d = list(render_annotated_frames(short_video, rows, output_width=480))
+        frames_3d = list(
+            render_annotated_frames(
+                short_video, rows, output_width=480, show_3d_view=True,
+                ball_heights_m=[0.0, 0.8, 1.5, 1.1, 0.2],
+            )
+        )
+        assert not np.array_equal(frames_2d[2][1], frames_3d[2][1])

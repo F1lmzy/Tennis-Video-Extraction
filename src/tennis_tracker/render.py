@@ -44,7 +44,13 @@ _COLOR_NET: tuple[int, int, int] = (200, 200, 200)        # Light grey net line
 # ── Defaults ───────────────────────────────────────────────────────────
 
 _DEFAULT_TARGET_HEIGHT: int = 540
-"""Resized source frame height in pixels."""
+"""Resized source frame height in pixels (legacy; layout now uses output width)."""
+
+_DEFAULT_OUTPUT_WIDTH: int = 1280
+"""Output video width in pixels; height is derived to keep a 16:9 aspect ratio."""
+
+_COLOR_CANVAS: tuple[int, int, int] = (24, 24, 24)
+"""Dark background fill for letterbox margins and panel gutters."""
 
 _DEFAULT_PANEL_WIDTH: int = 300
 """Width of the top-view court panel in pixels."""
@@ -272,11 +278,37 @@ def _build_3d_corner_camera(
     down = np.cross(forward, right)
 
     R = np.vstack([right, down, forward])
-    f_px = min(panel_width, panel_height) * 1.25
+
+    # Auto-fit the focal length and principal point so the court surround (with
+    # headroom for the net and airborne ball) fills the panel at any aspect ratio.
+    half_w = DOUBLES_WIDTH / 2.0 + 2.5
+    half_l = DOUBLES_LENGTH / 2.0 + 5.0
+    corners = np.array(
+        [
+            [-half_w, -half_l, 0.0],
+            [half_w, -half_l, 0.0],
+            [half_w, half_l, 0.0],
+            [-half_w, half_l, 0.0],
+            [-half_w, -half_l, 3.0],
+            [half_w, half_l, 3.0],
+        ],
+        dtype=np.float64,
+    )
+    pc = (R @ (corners - cam_pos).T).T
+    depth = np.maximum(pc[:, 2], 1e-3)
+    uv = pc[:, :2] / depth[:, None]
+    u_min, v_min = uv.min(axis=0)
+    u_max, v_max = uv.max(axis=0)
+    pad = 14.0
+    span_u = max(u_max - u_min, 1e-6)
+    span_v = max(v_max - v_min, 1e-6)
+    f_px = min((panel_width - 2 * pad) / span_u, (panel_height - 2 * pad) / span_v)
+    cx = panel_width * 0.5 - f_px * (u_min + u_max) * 0.5
+    cy = panel_height * 0.5 - f_px * (v_min + v_max) * 0.5
     K = np.array(
         [
-            [f_px, 0.0, panel_width * 0.50],
-            [0.0, f_px, panel_height * 0.53],
+            [f_px, 0.0, cx],
+            [0.0, f_px, cy],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
@@ -603,24 +635,76 @@ class AnnotatedVideoResult:
     output_height: int
 
 
+def _even(value: float) -> int:
+    """Round to the nearest even integer (codec-friendly dimensions)."""
+    return int(round(value / 2.0)) * 2
+
+
+def _compute_layout(output_width: int, show_3d_view: bool) -> dict[str, int]:
+    """Compute a 16:9 top/bottom panel layout for the given output width.
+
+    With the 3D view enabled the frame has two rows: the source video beside the
+    2D top-view court on top, and the full-width 3D corner view on the bottom.
+    Without it, the source video and 2D court share a single 16:9 row.
+    """
+    width = _even(max(320, output_width))
+    height = _even(width * 9.0 / 16.0)
+    if show_3d_view:
+        top_h = _even(height * 2.0 / 3.0)
+        bot_h = height - top_h
+        src_slot_w = _even(top_h * 16.0 / 9.0)
+        src_slot_w = min(src_slot_w, width - 160)
+        return {
+            "width": width,
+            "height": height,
+            "top_h": top_h,
+            "bot_h": bot_h,
+            "src_slot_w": src_slot_w,
+            "panel2d_w": width - src_slot_w,
+            "panel2d_h": top_h,
+            "panel3d_w": width,
+            "panel3d_h": bot_h,
+        }
+    panel2d_w = _even(width * 0.24)
+    return {
+        "width": width,
+        "height": height,
+        "top_h": height,
+        "bot_h": 0,
+        "src_slot_w": width - panel2d_w,
+        "panel2d_w": panel2d_w,
+        "panel2d_h": height,
+        "panel3d_w": 0,
+        "panel3d_h": 0,
+    }
+
+
 def render_annotated_frames(
     video_path: str | Path,
     output_rows: list[OutputRow],
     *,
-    target_height: int = _DEFAULT_TARGET_HEIGHT,
-    panel_width: int = _DEFAULT_PANEL_WIDTH,
+    output_width: int = _DEFAULT_OUTPUT_WIDTH,
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
     court_view: str = "doubles",
     show_3d_view: bool = False,
-    panel_3d_width: int = _DEFAULT_PANEL_3D_WIDTH,
     ball_heights_m: Optional[Sequence[Optional[float]]] = None,
 ) -> Iterator[tuple[int, np.ndarray]]:
-    """Yield annotated frames from a video and tracking output rows.
+    """Yield annotated frames in a 16:9 top/bottom layout.
 
-    For each frame in the video, this yields an annotated frame consisting of
-    the resized source frame with overlays on the left, a top-view 2D court
-    panel beside it, and optionally a 3D corner-view court panel on the right.
+    Each frame stacks the source video (with overlays) and 2D top-view court in
+    a top row, and — when *show_3d_view* is set — the 3D corner-view court in a
+    bottom row. The source is letterboxed to preserve its aspect ratio.
     """
+    layout = _compute_layout(output_width, show_3d_view)
+    width = layout["width"]
+    top_h = layout["top_h"]
+    bot_h = layout["bot_h"]
+    src_slot_w = layout["src_slot_w"]
+    panel2d_w = layout["panel2d_w"]
+    panel2d_h = layout["panel2d_h"]
+    panel3d_w = layout["panel3d_w"]
+    panel3d_h = layout["panel3d_h"]
+
     # ── Ball trail buffer ──
     ball_trail_pixels: list[tuple[float, float]] = []
     ball_trail_meters: list[tuple[float, float]] = []
@@ -632,18 +716,19 @@ def render_annotated_frames(
     for idx, (frame_index, frame_bgr) in enumerate(
         iter_frames(video_path, max_frames=total_rows)
     ):
-        # ── Resize source frame ──
+        # ── Fit source frame into its slot, preserving aspect ratio ──
         h, w = frame_bgr.shape[:2]
-        scale_h = target_height / h
-        new_w = int(w * scale_h)
-        resized = cv2.resize(frame_bgr, (new_w, target_height))
+        scale = min(src_slot_w / w, top_h / h)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(frame_bgr, (new_w, new_h))
 
         # ── Get the output row for this frame ──
         raw_output_row: Optional[OutputRow] = (
             output_rows[idx] if idx < total_rows else None
         )
         output_row = (
-            _scale_row_pixels(raw_output_row, scale_h)
+            _scale_row_pixels(raw_output_row, scale)
             if raw_output_row is not None
             else None
         )
@@ -705,32 +790,38 @@ def render_annotated_frames(
             diagnostics_text=diag_text,
         )
 
-        # ── Create and draw 2D top-view court panel ──
-        panel = np.zeros((target_height, panel_width, 3), dtype=np.uint8)
+        # ── Top row: letterboxed source (left) + 2D top-view court (right) ──
+        top_row = np.full((top_h, width, 3), _COLOR_CANVAS, dtype=np.uint8)
+        x_off = (src_slot_w - new_w) // 2
+        y_off = (top_h - new_h) // 2
+        top_row[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+
+        panel2d = np.zeros((panel2d_h, panel2d_w, 3), dtype=np.uint8)
         _draw_court_panel(
-            panel,
+            panel2d,
             output_row,
             ball_trail_meters=ball_trail_meters,
-            panel_width=panel_width,
-            panel_height=target_height,
+            panel_width=panel2d_w,
+            panel_height=panel2d_h,
             court_view=court_view,
         )
+        top_row[0:panel2d_h, src_slot_w:src_slot_w + panel2d_w] = panel2d
 
-        # ── Combine side-by-side panels ──
-        if show_3d_view:
-            panel_3d = np.zeros((target_height, panel_3d_width, 3), dtype=np.uint8)
+        # ── Bottom row: full-width 3D corner view (when enabled) ──
+        if show_3d_view and bot_h > 0:
+            panel3d = np.zeros((panel3d_h, panel3d_w, 3), dtype=np.uint8)
             _draw_court_3d_panel(
-                panel_3d,
+                panel3d,
                 output_row,
                 ball_z_m=ball_z,
                 ball_trail_3d=ball_trail_3d,
-                panel_width=panel_3d_width,
-                panel_height=target_height,
+                panel_width=panel3d_w,
+                panel_height=panel3d_h,
                 court_view=court_view,
             )
-            annotated = np.concatenate([resized, panel, panel_3d], axis=1)
+            annotated = np.concatenate([top_row, panel3d], axis=0)
         else:
-            annotated = np.concatenate([resized, panel], axis=1)
+            annotated = top_row
 
         yield (frame_index, annotated)
 
@@ -740,19 +831,17 @@ def render_annotated_video(
     output_rows: list[OutputRow],
     output_video_path: str | Path,
     *,
-    target_height: int = _DEFAULT_TARGET_HEIGHT,
-    panel_width: int = _DEFAULT_PANEL_WIDTH,
+    output_width: int = _DEFAULT_OUTPUT_WIDTH,
     ball_trail_length: int = _DEFAULT_BALL_TRAIL_LENGTH,
     fps: Optional[float] = None,
     court_view: str = "doubles",
     show_3d_view: bool = False,
-    panel_3d_width: int = _DEFAULT_PANEL_3D_WIDTH,
     ball_heights_m: Optional[Sequence[Optional[float]]] = None,
 ) -> AnnotatedVideoResult:
     """Render an annotated video file from source + tracking data.
 
-    Writes an MP4 video combining resized source frames with overlays,
-    a 2D top-view court panel, and optionally a 3D corner-view court panel.
+    Writes a 16:9 MP4 stacking the source video and 2D top-view court in a top
+    row, with an optional full-width 3D corner-view court in a bottom row.
     """
     # ── Determine FPS ──
     if fps is None:
@@ -772,12 +861,10 @@ def render_annotated_video(
         for _, annotated in render_annotated_frames(
             video_path,
             output_rows,
-            target_height=target_height,
-            panel_width=panel_width,
+            output_width=output_width,
             ball_trail_length=ball_trail_length,
             court_view=court_view,
             show_3d_view=show_3d_view,
-            panel_3d_width=panel_3d_width,
             ball_heights_m=ball_heights_m,
         ):
             if frame_count == 0:
