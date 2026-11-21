@@ -151,12 +151,12 @@ def _is_valid_flight_pair(kind0: str, y0: float, kind1: str, y1: float) -> bool:
     ``near_bounce``, or ``near_hit`` straight to ``near_hit``), which would
     place the reconstructed ball in the wrong part of the court.
     """
-    if kind0 == "near_hit" and kind1 == "far_bounce":
-        return y1 > y0
+    if kind0 == "near_hit" and kind1 in ("near_bounce", "far_bounce"):
+        return y1 > y0 + (2.0 if kind1 == "near_bounce" else 0.0)
     if kind0 == "far_bounce" and kind1 == "far_hit":
         return y1 >= y0 - 1.0
-    if kind0 == "far_hit" and kind1 == "near_bounce":
-        return y1 < y0
+    if kind0 == "far_hit" and kind1 in ("near_bounce", "far_bounce"):
+        return y1 < y0 - (2.0 if kind1 == "far_bounce" else 0.0)
     if kind0 == "near_bounce" and kind1 == "near_hit":
         return y1 <= y0 + 1.0
     if kind0 == "near_hit" and kind1 == "far_hit":
@@ -164,6 +164,41 @@ def _is_valid_flight_pair(kind0: str, y0: float, kind1: str, y1: float) -> bool:
     if kind0 == "far_hit" and kind1 == "near_hit":
         return y1 < y0 - 4.0
     return False
+
+
+def _image_contact_motion(
+    rows: Sequence[OutputRow], i: int,
+) -> Optional[tuple[float, float, float, float]]:
+    """Estimate image velocity on either side of contact, skipping short gaps."""
+    x, y = rows[i].ball_pixel_x, rows[i].ball_pixel_y
+    if x is None or y is None:
+        return None
+    velocities = []
+    for direction in (-1, 1):
+        for offset in (2, 1, 3, 4):
+            j = i + direction * offset
+            if not 0 <= j < len(rows):
+                continue
+            other_x, other_y = rows[j].ball_pixel_x, rows[j].ball_pixel_y
+            if other_x is not None and other_y is not None:
+                velocities.extend(((other_x - x) / (j - i), (other_y - y) / (j - i)))
+                break
+        else:
+            return None
+    return velocities[0], velocities[1], velocities[2], velocities[3]
+
+
+def _sustained_lateral_turn(rows: Sequence[OutputRow], i: int, vx_in: float, vx_out: float) -> bool:
+    """Confirm direction on both sides without using the contact sample itself."""
+    for direction, velocity in ((-1, vx_in), (1, vx_out)):
+        xs = [
+            rows[j].ball_pixel_x
+            for offset in range(1, 9)
+            if 0 <= (j := i + direction * offset) < len(rows) and rows[j].ball_pixel_x is not None
+        ]
+        if len(xs) < 2 or any((x - xs[0]) * direction * velocity < -0.5 for x in xs[1:3]):
+            return False
+    return True
 
 
 def _detect_hits(
@@ -210,14 +245,28 @@ def _detect_hits(
         if not left_vals or not right_vals:
             continue
         all_vals = [v for _, v in win_vals]
+        motion = _image_contact_motion(rows, i)
+        if motion is not None:
+            vx_in, vy_in, vx_out, vy_out = motion
+            dx, dy = abs(vx_out - vx_in), vy_out - vy_in
+            if by[i] > 4.0:
+                depth_peak = max(all_vals) - by[i] <= 0.8
+                sideways_turn = (
+                    vx_in * vx_out < 0 and dx >= 2.0
+                    and _sustained_lateral_turn(rows, i, vx_in, vx_out)
+                )
+                # A serve can be struck on its way down, well after the toss apex.
+                overhead = abs(vx_in) <= 2.5 and abs(vy_in) <= 8.0 and vy_out >= 14.0 and dy >= 12.0
+                # A smooth apex can reverse depth without impact; only use it
+                # when the velocity also changes abruptly.
+                peak_impact = depth_peak and (dy >= 5.0 or (dx >= 3.5 and vx_in * vx_out > 0))
+                if sideways_turn or peak_impact or overhead:
+                    _try_hit(i, "far", dx + max(0.0, dy))
+            if by[i] < -4.0 and vy_out <= -18.0 and dy <= -18.0:
+                if dx >= 7.0 or -vy_out >= max(28.0, 1.8 * vy_in):
+                    _try_hit(i, "near", abs(dy) + dx)
 
-        if by[i] > 4.0 and by[i] >= max(all_vals):
-            prom_l = by[i] - min(left_vals)
-            prom_r = by[i] - min(right_vals)
-            if prom_l >= 0.5 and prom_r >= 0.5:
-                _try_hit(i, "far", prom_l + prom_r)
-
-        if by[i] < -4.0 and by[i] <= min(all_vals):
+        if i not in raw_anchors and by[i] < -4.0 and by[i] <= min(all_vals):
             prom_l = max(left_vals) - by[i]
             prom_r = max(right_vals) - by[i]
             if prom_l >= 0.5 and prom_r >= 0.5:
@@ -241,6 +290,20 @@ def _detect_hits(
             continue
         if by[i] > 6.0 and by[i] > min(prev_vals) + 1.0 and min(post_vals) < by[i] - 2.0:
             _try_hit(i, "far", 1.0)
+
+
+def _has_lateral_continuity(
+    rows: Sequence[OutputRow], samples: tuple[int, int, int, int]
+) -> bool:
+    """Check that observed image X keeps its direction and approximate speed."""
+    speeds = []
+    for a, b in zip(samples, samples[1:]):
+        x0, x1 = rows[a].ball_pixel_x, rows[b].ball_pixel_x
+        if b - a > 2 or x0 is None or x1 is None:
+            return False
+        speeds.append((x1 - x0) / (b - a))
+    incoming, *outgoing = speeds
+    return abs(incoming) >= 1.0 and all(0.5 <= v / incoming <= 1.5 for v in outgoing)
 
 
 def _detect_bounces(
@@ -277,26 +340,23 @@ def _detect_bounces(
     next_obs = {a: b for a, b in zip(observed, observed[1:])}
     hit_set = set(hit_indices)
 
-    def _near_hit(i: int) -> bool:
-        return any(abs(i - h) <= 5 for h in hit_set)
-
-    for i in observed:
-        s = next_obs.get(i)
-        if s is None or np.isnan(vel[i]) or np.isnan(vel[s]):
-            continue
-        if _near_hit(i):
+    for a, i, s in zip(observed, observed[1:], observed[2:]):
+        if np.isnan(vel[i]) or np.isnan(vel[s]):
             continue
         if not (-13.0 <= by[i] <= 13.0 and -6.5 <= bx[i] <= 6.5):
             continue
         v_in = float(vel[i])
         v_out = float(vel[s])
-        if v_in <= 0.5:
-            continue
         kink = v_in - v_out
-        # Threshold scales with the *approach* speed so small far-court cusps
-        # are caught without being masked by the fast post-bounce departure.
-        threshold = max(1.5, 0.55 * v_in)
-        if kink < threshold:
+        # In the far court, perspective can keep the ball's image rising all
+        # the way into contact. The bounce still makes it rise much faster.
+        if v_in <= 0.5:
+            if not (by[i] > 0.0 and v_in >= -5.0 and v_out <= -5.0 and kink >= 5.0):
+                continue
+            motion = _image_contact_motion(rows, i)
+            if motion is None or abs(motion[2] - motion[0]) > max(2.0, 0.55 * abs(motion[0])):
+                continue
+        elif kink < max(1.5, 0.55 * v_in):
             continue
         # Persistence: the departure velocity must stay well below the approach,
         # rejecting single-frame noise wiggles that immediately resume.
@@ -305,6 +365,29 @@ def _detect_bounces(
         if v_out2 > v_in - 0.6 * kink:
             continue
         kind = "far_bounce" if by[i] >= 0.0 else "near_bounce"
+        close_hits = hit_set.intersection(range(i - 5, i + 6))
+        if close_hits:
+            hit = raw_anchors.get(i)
+            # A near bounce can create a depth minimum that looks like a hit.
+            # Only override a same-frame hit with clear ground-contact evidence.
+            replace_hit = (
+                kind == "near_bounce" and hit is not None and hit[0] == "near_hit"
+                and by[i] - hit[1] > 3.0 and s2 is not None
+                and _has_lateral_continuity(rows, (a, i, s, s2))
+            )
+            # A genuine bounce and the ensuing racket contact can be only a
+            # few frames apart. Require separate observations of the rebound.
+            separate_bounce = kink >= 4.0 and s2 is not None and all(
+                i + 3 <= h and s2 < h and _is_valid_flight_pair(kind, by[i], *raw_anchors[h][:2])
+                for h in close_hits
+            )
+            if separate_bounce:
+                motion = _image_contact_motion(rows, i)
+                separate_bounce = motion is not None and (
+                    abs(motion[2] - motion[0]) <= max(2.5, 0.65 * abs(motion[0]))
+                )
+            if not replace_hit and not separate_bounce:
+                continue
         raw_anchors[i] = (kind, by[i], 0.0, kink)
 
 

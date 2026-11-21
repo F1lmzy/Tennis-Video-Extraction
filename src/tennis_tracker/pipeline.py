@@ -33,6 +33,10 @@ from tennis_tracker.types import OutputRow, PixelPoint
 from tennis_tracker.video import iter_frames, read_video_metadata, write_video
 
 
+_HOTSPOT_CONTINUATION_RADIUS_PX = 20.0
+_HOTSPOT_MIN_DISPLACEMENT_PX = 2.0
+
+
 @dataclass
 class SyntheticDetection:
     """Synthetic detection for a single object on a single frame."""
@@ -773,14 +777,47 @@ def run_process(
     ball_missing_frames = 0
 
     for i, raw_dets in enumerate(raw_ball_dets_per_frame):
-        cleaned_dets = filter_static_ball_hotspots(raw_dets, static_hotspots)
         motions = ball_motion_per_frame[i]
         r_boxes = racket_boxes_per_frame[i]
         p_boxes = player_boxes_per_frame[i]
 
-        # On active tracks, allow a softer motion floor (0.5x) for high-confidence
-        # detections (preserves slow apexes on high lobs and serve tosses while
-        # still rejecting static zero-motion artifacts).
+        effective_max_jump = ball_max_jump_px * (
+            1.0 + 0.5 * min(ball_missing_frames, ball_max_missing_frames)
+        )
+        predicted_center: Optional[PixelPoint] = None
+        if previous_ball is not None and previous_ball_vel is not None:
+            dt = ball_missing_frames + 1
+            predicted_center = PixelPoint(
+                x=previous_ball.center.x + previous_ball_vel[0] * dt,
+                y=previous_ball.center.y + previous_ball_vel[1] * dt,
+            )
+
+        cleaned_dets = filter_static_ball_hotspots(raw_dets, static_hotspots)
+        if (
+            previous_ball is not None
+            and predicted_center is not None
+            and ball_missing_frames <= 1
+            and len(cleaned_dets) < len(raw_dets)
+        ):
+            # A hotspot can lie on a real flight path. Keep the mask for acquisition,
+            # but let moving observations near a recent track's prediction through.
+            unmasked = set(cleaned_dets)
+            radius = min(_HOTSPOT_CONTINUATION_RADIUS_PX, ball_max_jump_px)
+            cleaned_dets = [
+                det
+                for det in raw_dets
+                if det in unmasked or (
+                    motions[det] > 0.0
+                    and motions[det] >= ball_motion_threshold
+                    and ball_center_distance(det, previous_ball) >= _HOTSPOT_MIN_DISPLACEMENT_PX
+                    and np.hypot(
+                        det.center.x - predicted_center.x, det.center.y - predicted_center.y
+                    ) <= radius
+                )
+            ]
+
+        # On active tracks, allow a softer motion floor for high-confidence
+        # detections while still rejecting static zero-motion artifacts by default.
         moving_dets = [
             det
             for det in cleaned_dets
@@ -794,17 +831,6 @@ def run_process(
             )
         ]
         ball_candidates_per_frame.append(moving_dets)
-
-        effective_max_jump = ball_max_jump_px * (
-            1.0 + 0.5 * min(ball_missing_frames, ball_max_missing_frames)
-        )
-        predicted_center: Optional[PixelPoint] = None
-        if previous_ball is not None and previous_ball_vel is not None:
-            dt = ball_missing_frames + 1
-            predicted_center = PixelPoint(
-                x=previous_ball.center.x + previous_ball_vel[0] * dt,
-                y=previous_ball.center.y + previous_ball_vel[1] * dt,
-            )
 
         if previous_ball is not None:
             cands = [

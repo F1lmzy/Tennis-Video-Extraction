@@ -658,6 +658,22 @@ class TestSelectBestBall:
         )
         assert refined_b[2] is bounce
 
+    def test_refinement_repairs_short_detached_track_across_missing_frames(self) -> None:
+        before = [_ball(100, 300), _ball(112, 290)]
+        after = [_ball(184, 230), _ball(196, 220)]
+        wrong = [_ball(240, 145, confidence=0.9), _ball(242, 145, confidence=0.9)]
+        racket = _ball(148, 260, confidence=0.5)
+        actual = _ball(148, 268, confidence=0.8)
+        selected = [*before, None, *wrong, None, None, *after]
+        candidates = [[d] if d is not None else [] for d in selected]
+        candidates[4].extend((racket, actual))
+        racket_boxes = [[] for _ in selected]
+        racket_boxes[4].append(BoundingBox(147, 259, 149, 261))
+
+        refined = refine_ball_sequence(selected, candidates, racket_boxes_per_frame=racket_boxes)
+
+        assert refined == [*before, None, None, actual, None, None, *after]
+
     def test_static_hotspot_mask_removes_persistent_wall_logo_keeps_moving_ball(self) -> None:
         """Repeated detections on a static logo are masked while moving balls survive."""
         frames_dets = []

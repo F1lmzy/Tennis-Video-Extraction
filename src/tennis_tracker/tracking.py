@@ -8,6 +8,7 @@ diagnostics for missing or ambiguous cases.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -672,6 +673,72 @@ def filter_static_ball_hotspots(
     ]
 
 
+def _repair_detached_ball_runs(
+    refined: list[Optional[BallDetection]],
+    candidates: list[list[BallDetection]],
+    *,
+    penalty: Callable[[int, BallDetection], float],
+    max_bridge_px: float,
+    kink_threshold_px: float,
+) -> None:
+    """Bridge short detours only when independent observations support both ends."""
+    observed = [(i, det) for i, det in enumerate(refined) if det is not None]
+
+    def velocity(a: tuple[int, BallDetection], b: tuple[int, BallDetection]) -> np.ndarray:
+        i, u = a
+        j, v = b
+        return np.array([v.center.x - u.center.x, v.center.y - u.center.y]) / (j - i)
+
+    for j in range(1, len(observed) - 3):
+        left, start = observed[j]
+        prev = observed[j - 1]
+        if refined[left] is not start or refined[prev[0]] is not prev[1]:
+            continue
+        for k in range(j + 2, min(j + 6, len(observed) - 1)):
+            right, end = observed[k]
+            span = right - left
+            if span > 11:
+                break
+            following = observed[k + 1]
+            if refined[right] is not end or refined[following[0]] is not following[1]:
+                continue
+            if left - prev[0] > 3 or following[0] - right > 3:
+                continue
+            vx, vy = bridge = velocity(observed[j], observed[k])
+            speed = np.linalg.norm(bridge)
+            if not 3.0 <= speed <= max_bridge_px / span:
+                continue
+            # A real contact generally changes the direction or speed on one
+            # side. Do not replace it with a chord through unrelated endpoints.
+            flanks = (velocity(prev, observed[j]), velocity(observed[k], following))
+            if any(
+                not 0.45 * speed <= np.linalg.norm(v) <= 2.0 * speed
+                or np.dot(v, bridge) < 0.65 * np.linalg.norm(v) * speed
+                for v in flanks
+            ):
+                continue
+
+            def error(t: int, det: BallDetection) -> float:
+                return _dist(
+                    det.center.x, det.center.y,
+                    start.center.x + vx * (t - left), start.center.y + vy * (t - left),
+                )
+
+            interior = observed[j + 1:k]
+            if any(
+                refined[t] is not det or error(t, det) <= kink_threshold_px for t, det in interior
+            ):
+                continue
+            for t in range(left + 1, right):
+                close = (det for det in candidates[t] if error(t, det) <= 15.0)
+                refined[t] = min(
+                    close,
+                    key=lambda det: error(t, det) + 30.0 * penalty(t, det) - 10.0 * det.confidence,
+                    default=None,
+                )
+            break
+
+
 def refine_ball_sequence(
     selected: list[Optional[BallDetection]],
     candidates_per_frame: list[list[BallDetection]],
@@ -681,9 +748,9 @@ def refine_ball_sequence(
     max_bridge_px: float = 180.0,
     kink_threshold_px: float = 40.0,
 ) -> list[Optional[BallDetection]]:
-    """Bidirectional trajectory refinement and 1-frame racket-spike pruning.
+    """Bidirectional trajectory refinement and short false-track pruning.
 
-    Runs two lightweight offline passes over the per-frame ball selections:
+    Runs offline passes over the per-frame ball selections:
       1. **Bidirectional candidate swap**: When frame ``t`` is bracketed by
          ``t-1`` and ``t+1`` (or starts a run followed by ``t+1`` and ``t+2``),
          check all motion-valid candidates on frame ``t``. If an alternative
@@ -694,6 +761,8 @@ def refine_ball_sequence(
          while the surrounding segment ``t-2 → t-1 → t+1`` (or ``t-1 → t+1 → t+2``)
          is collinear (not a real bounce/hit reversal), drop the 1-frame spike
          so downstream smoothing fills it cleanly.
+      3. **Detached run repair**: Reconsider short excursions away from a
+         trajectory supported by observations before and after a gap.
     """
     n = len(selected)
     if n < 3:
@@ -819,4 +888,8 @@ def refine_ball_sequence(
     for t in to_drop:
         refined[t] = None
 
+    _repair_detached_ball_runs(
+        refined, candidates_per_frame, penalty=_penalty,
+        max_bridge_px=max_bridge_px, kink_threshold_px=kink_threshold_px,
+    )
     return refined

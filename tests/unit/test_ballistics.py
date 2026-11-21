@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from tennis_tracker.ballistics import (
+    _detect_anchors,
     correct_ball_elevation,
     correct_ball_elevation_with_heights,
     estimate_camera_position,
@@ -93,6 +94,120 @@ class TestEstimateCameraPosition:
 
 
 class TestCorrectBallElevation:
+    @pytest.mark.parametrize(
+        ("player_depth", "second_exit_vx", "missing_after_contact", "kind"),
+        [
+            (-13.0, -12.0, False, "near_bounce"),
+            (-13.0, 24.0, False, "near_hit"),
+            (-8.0, -12.0, False, "near_hit"),
+            (-13.0, -12.0, True, "near_hit"),
+        ],
+        ids=["distant-bounce", "racket-reversal", "near-player", "uncertain-exit"],
+    )
+    def test_near_court_contact_with_both_hit_and_bounce_evidence(
+        self,
+        player_depth: float,
+        second_exit_vx: float,
+        missing_after_contact: bool,
+        kind: str,
+    ) -> None:
+        # A depth minimum can be claimed as a hit even when the visible ball
+        # bounces well in front of the player. Inspect its motion on both sides.
+        contact = 20
+        rows = []
+        for f in range(37):
+            t = f - contact
+            if t <= 0:
+                depth, x, y = -5.0 - 0.8 * t, 776.0 - 14.0 * t, 551.0 + 14.0 * t
+            else:
+                depth, x, y = -5.0 + 0.2 * t, 764.0 + second_exit_vx * (t - 1), 551.0 - 6.0 * t
+            visible = not (missing_after_contact and t in (1, 2))
+            rows.append(
+                _make_row(
+                    f,
+                    near_xy=(-2.5, player_depth),
+                    ball_xy=(-2.0, depth) if visible else None,
+                    ball_px=(x, y) if visible else None,
+                )
+            )
+
+        anchor = _detect_anchors(rows, (0.0, -33.0, 10.0))[contact]
+        assert anchor[0] == kind
+        if kind == "near_bounce":
+            assert anchor[1:] == (-5.0, 0.0)
+        else:
+            assert anchor[1] == player_depth
+
+    @pytest.mark.parametrize("approach", [-2.0, 0.2])
+    def test_detects_far_bounce_while_ball_image_is_still_rising(self, approach: float) -> None:
+        contact = 10
+        rows = [
+            _make_row(
+                i,
+                ball_xy=(1.0, 7.0 + (0.1 if i <= contact else 0.6) * (i - contact)),
+                ball_px=(
+                    900.0 + 2.0 * i,
+                    335.0 + (approach if i <= contact else -12.0) * (i - contact),
+                ),
+            )
+            for i in range(19)
+        ]
+        assert _detect_anchors(rows, (0.0, -33.0, 10.0))[contact] == ("far_bounce", 7.0, 0.0)
+
+    def test_smooth_far_apex_does_not_become_a_racket_hit(self) -> None:
+        rows = [
+            _make_row(i, ball_xy=(1.0, 17.0 - 0.03 * (i - 15) ** 2),
+                      ball_px=(900.0 + 5.0 * i, 210.0 + 0.35 * (i - 15) ** 2))
+            for i in range(31)
+        ]
+        assert _detect_anchors(rows, (0.0, -33.0, 10.0)) == {}
+
+    def test_near_racket_contact_does_not_require_a_depth_minimum(self) -> None:
+        rows = []
+        for i in range(30):
+            t = i - 10
+            depth = -8.5 + (0.05 if t <= 0 else 1.1) * t
+            x = 750.0 + (-10 if t <= 0 else 15) * t
+            y = 690.0 + (1 if t <= 0 else -32) * t
+            rows.append(_make_row(i, ball_xy=(0.0, depth), ball_px=(x, y)))
+        assert _detect_anchors(rows, (0.0, -33.0, 10.0))[10][0] == "near_hit"
+
+    def test_far_bounce_and_hit_can_be_four_frames_apart(self) -> None:
+        rows = []
+        for i in range(22):
+            if i <= 8:
+                depth, x, y = 10.0 - 0.2 * (i - 8), 900.0 + 4 * i, 320.0 + 2 * (i - 8)
+            elif i <= 12:
+                depth = 10.0 + 1.6 * (i - 8)
+                x, y = 932.0 + 2 * (i - 8), 320.0 - 10 * (i - 8)
+            else:
+                depth, x, y = 16.4 - 0.8 * (i - 12), 940.0 - 6 * (i - 12), 280.0 + 4 * (i - 12)
+            rows.append(_make_row(i, ball_xy=(1.0, depth), ball_px=(x, y)))
+
+        corrected, heights = correct_ball_elevation_with_heights(rows, (0.0, -33.0, 10.0))
+
+        assert heights[8] == 0.0
+        assert 0.0 < heights[10] < heights[12]
+        assert corrected[12].ball_y_m == pytest.approx(12.0)
+
+    def test_reconstructs_short_far_return_to_bounce_on_same_half(self) -> None:
+        rows = []
+        for i in range(32):
+            if i <= 8:
+                depth, x, y = 20.0 + 0.2 * i, 910.0 + 2 * i, 230.0 - 5 * i
+            elif i <= 25:
+                depth, x, y = 21.6 - 1.1 * (i - 8), 926.0 - 5 * (i - 8), 190.0 + 13 * (i - 8)
+            else:
+                depth, x, y = 2.9 + 0.1 * (i - 25), 841.0 - 5 * (i - 25), 411.0 - 7 * (i - 25)
+            rows.append(_make_row(i, ball_xy=(1.0, depth), ball_px=(x, y)))
+
+        corrected, heights = correct_ball_elevation_with_heights(rows, (0.0, -33.0, 10.0))
+
+        assert corrected[8].ball_y_m == pytest.approx(12.0)
+        assert 0.0 < heights[16] < heights[8]
+        assert heights[25] == 0.0
+        assert corrected[25].ball_y_m == pytest.approx(2.9)
+
     def test_removes_behind_far_player_parallax_while_preserving_bounce(self) -> None:
         cam = (0.0, -33.0, 10.0)
         rows: list[OutputRow] = []

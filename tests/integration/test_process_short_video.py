@@ -568,6 +568,59 @@ class TestRealPipelineMocked:
         assert rows[9]["ball_pixel_x"] != ""
         assert rows[10]["ball_pixel_x"] != ""
 
+    def test_ball_continues_through_static_hotspot(self, tmp_path: Path) -> None:
+        """A moving track may cross a hotspot without picking up the static object."""
+        from unittest.mock import Mock
+
+        from tennis_tracker.detection import BallDetection, BoundingBox
+
+        def detection(x: int, y: int, score: float) -> BallDetection:
+            box = BoundingBox(x - 2, y - 2, x + 3, y + 3)
+            return BallDetection(box, box.center, score)
+
+        logo = detection(90, 40, 0.98)
+        positions = list(range(35, 126, 5))
+        frames = []
+        candidates = []
+        # The ball passes within the stationary logo's 28 px exclusion radius.
+        # The logo persists long enough to be learned by the actual hotspot pass.
+        missing_frame = 10
+        for i, x in enumerate([*positions, *([None] * 16)]):
+            frame = np.zeros((100, 160, 3), dtype=np.uint8)
+            frame[38:43, 88:93] = 255
+            dets = [logo]
+            if i == missing_frame:
+                # Moving impostor inside the hotspot, but far from the predicted ball.
+                frame[18:23, 83:88] = 255
+                dets.append(detection(85, 20, 0.99))
+            elif x is not None:
+                frame[53:58, x - 2 : x + 3] = 255
+                dets.append(detection(x, 55, 0.7))
+            frames.append(frame)
+            candidates.append(dets)
+
+        video = tmp_path / "hotspot.mp4"
+        raw = tmp_path / "hotspot_raw.csv"
+        write_video(frames, video, fps=30.0)
+        run_process(
+            video,
+            raw,
+            tmp_path / "hotspot_smoothed.csv",
+            None,
+            ball_detector=Mock(predict=Mock(side_effect=candidates)),
+        )
+
+        rows = list(read_csv_rows(raw))
+        # Frame zero is intentionally not backfilled by initial acquisition.
+        for i, x in enumerate(positions[1:], start=1):
+            if i == missing_frame:
+                assert not rows[i]["ball_pixel_x"]
+                continue
+            assert rows[i]["ball_pixel_x"], f"lost the visible ball on frame {i}"
+            assert float(rows[i]["ball_pixel_x"]) == x + 0.5
+            assert float(rows[i]["ball_pixel_y"]) == 55.5
+        assert all(not row["ball_pixel_x"] for row in rows[len(positions) :])
+
     def test_full_frame_read_count(self, short_video: Path, tmp_path: Path) -> None:
         """Should process the correct number of frames."""
         from unittest.mock import MagicMock
