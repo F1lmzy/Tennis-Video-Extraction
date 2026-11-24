@@ -130,3 +130,72 @@ class TestProcessOnColab:
         assert any("/content/ball_yolo26.pt" in cmd for cmd in upload_cmds)
         assert len(download_cmds) == 3
         assert any("stop" in cmd for cmd in recorded_cmds)
+
+    def test_upload_file_chunks_large_files_and_reassembles(self, tmp_path: Path) -> None:
+        module = _load_script_module()
+        big_file = tmp_path / "big.mp4"
+        payload = b"0123456789abcdef" * 10  # 160 bytes
+        big_file.write_bytes(payload)
+
+        uploaded: dict[str, bytes] = {}
+
+        def fake_run(cmd, check=True, capture_output=False, text=False, timeout=None):
+            if "upload" in cmd:
+                local_src = Path(cmd[-2])
+                remote_dst = cmd[-1]
+                uploaded[remote_dst] = local_src.read_bytes()
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "exec" in cmd:
+                script_src = Path(cmd[-1]).read_text(encoding="utf-8")
+                compile(script_src, "<reassemble>", "exec")
+                assert f"total == {len(payload)}" in script_src
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="[remote] Reassembled\n", stderr=""
+                )
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(module.subprocess, "run", side_effect=fake_run):
+            module._upload_file(
+                "colab",
+                "sess",
+                big_file,
+                "/content/big.mp4",
+                tmp_dir=tmp_path,
+                chunk_bytes=64,
+            )
+
+        assert len(uploaded) == 3
+        reassembled = b"".join(uploaded[k] for k in sorted(uploaded))
+        assert reassembled == payload
+
+    def test_download_file_chunked_reassembles_parts(self, tmp_path: Path) -> None:
+        module = _load_script_module()
+        expected = b"abcdefghij" * 20
+        parts_data = {
+            "/content/.dl_chunks/out/part_0000": expected[:80],
+            "/content/.dl_chunks/out/part_0001": expected[80:160],
+            "/content/.dl_chunks/out/part_0002": expected[160:],
+        }
+
+        def fake_run(cmd, check=True, capture_output=False, text=False, timeout=None):
+            if "exec" in cmd:
+                script_file = Path(cmd[-1])
+                if script_file.name.startswith("split_"):
+                    manifest = {"size": len(expected), "parts": sorted(parts_data.keys())}
+                    out = f"{module.DL_MANIFEST_MARKER}{json.dumps(manifest)}\n"
+                    return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "download" in cmd:
+                remote_part = cmd[-2]
+                local_part = Path(cmd[-1])
+                local_part.write_bytes(parts_data[remote_part])
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        out_path = tmp_path / "out.mp4"
+        with patch.object(module.subprocess, "run", side_effect=fake_run):
+            module._download_file_chunked(
+                "colab", "sess", "/content/out.mp4", out_path, tmp_dir=tmp_path, chunk_bytes=80
+            )
+
+        assert out_path.read_bytes() == expected

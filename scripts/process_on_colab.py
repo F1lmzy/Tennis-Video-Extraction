@@ -37,6 +37,8 @@ REMOTE_LOG_PATH = "/content/process.log"
 REMOTE_EXITCODE_PATH = "/content/process.exitcode"
 LAUNCH_MARKER = "__COLAB_PROCESS_LAUNCHED__"
 POLL_MARKER = "__COLAB_POLL__:"
+DL_MANIFEST_MARKER = "__COLAB_DL_MANIFEST__:"
+TRANSFER_CHUNK_BYTES = 15 * 1024 * 1024  # 15 MiB raw (~20 MiB base64 JSON, under 32 MiB proxy cap)
 
 _GPU_CHOICES = ["T4", "L4", "G4", "H100", "A100"]
 
@@ -99,9 +101,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-fps",
-        type=int,
-        default=30,
-        help="Target processing FPS (default: 30).",
+        type=float,
+        default=None,
+        help="Target processing FPS (default: preserve source video FPS).",
     )
     parser.add_argument(
         "--gpu",
@@ -258,8 +260,7 @@ def build_remote_script(cfg: dict[str, Any]) -> str:
         cfg["court_model_remote"],
         "--device",
         str(cfg["device"]),
-        "--target-fps",
-        str(cfg["target_fps"]),
+        *(["--target-fps", str(cfg["target_fps"])] if cfg["target_fps"] is not None else []),
         *cfg["extra_args"],
     ]
     cmd_items = [process_cmd[0]] + [repr(item) for item in process_cmd[1:]]
@@ -462,12 +463,211 @@ def _poll_remote_job(
         time.sleep(poll_interval)
 
 
+def _upload_file(
+    colab_bin: str,
+    session: str,
+    local_path: Path,
+    remote_path: str,
+    tmp_dir: Path,
+    dry_run: bool = False,
+    chunk_bytes: int = TRANSFER_CHUNK_BYTES,
+) -> None:
+    """Upload a local file to Colab, automatically chunking large files."""
+    file_size = local_path.stat().st_size if local_path.is_file() else 0
+    if dry_run or file_size <= chunk_bytes:
+        _run_colab(
+            colab_bin,
+            ["upload", "-s", session, str(local_path), remote_path],
+            dry_run=dry_run,
+        )
+        return
+
+    num_chunks = (file_size + chunk_bytes - 1) // chunk_bytes
+    chunk_dir = tmp_dir / f"upload_{local_path.stem}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    remote_prefix = f"/content/.upload_chunk_{local_path.name}"
+    remote_parts: list[str] = []
+
+    print(
+        f"[colab-process] Chunked upload: {local_path.name} "
+        f"({file_size / (1024 * 1024):.1f} MiB in {num_chunks} parts)...",
+        flush=True,
+    )
+    with local_path.open("rb") as src_fh:
+        for idx in range(num_chunks):
+            data = src_fh.read(chunk_bytes)
+            local_part = chunk_dir / f"part_{idx:04d}"
+            local_part.write_bytes(data)
+            remote_part = f"{remote_prefix}.part_{idx:04d}"
+            remote_parts.append(remote_part)
+            for attempt in range(1, 4):
+                try:
+                    _run_colab(
+                        colab_bin,
+                        ["upload", "-s", session, str(local_part), remote_part],
+                        capture_output=True,
+                    )
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(2.0 * attempt)
+            local_part.unlink(missing_ok=True)
+            print(
+                f"[colab-process]   Uploaded part {idx + 1}/{num_chunks} "
+                f"({min(file_size, (idx + 1) * chunk_bytes) / (1024 * 1024):.1f}/"
+                f"{file_size / (1024 * 1024):.1f} MiB)",
+                flush=True,
+            )
+
+    reassemble_script = tmp_dir / f"reassemble_{local_path.stem}.py"
+    reassemble_script.write_text(
+        "\n".join(
+            [
+                "from pathlib import Path",
+                f"parts = {remote_parts!r}",
+                f"dest = Path({remote_path!r})",
+                "dest.parent.mkdir(parents=True, exist_ok=True)",
+                "total = 0",
+                "with dest.open('wb') as out_fh:",
+                "    for p in parts:",
+                "        pp = Path(p)",
+                "        data = pp.read_bytes()",
+                "        out_fh.write(data)",
+                "        total += len(data)",
+                "        pp.unlink(missing_ok=True)",
+                f"assert total == {file_size}, f'Size mismatch: {{total}} != {file_size}'",
+                "print(f'[remote] Reassembled {dest} ({total} bytes)')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res = _run_colab(
+        colab_bin,
+        ["exec", "-s", session, "--timeout", "180.0", "-f", str(reassemble_script)],
+        capture_output=True,
+    )
+    if res and res.stdout:
+        print(res.stdout, end="", flush=True)
+
+
+def _download_file_chunked(
+    colab_bin: str,
+    session: str,
+    remote_path: str,
+    local_path: Path,
+    tmp_dir: Path,
+    chunk_bytes: int = TRANSFER_CHUNK_BYTES,
+) -> None:
+    """Split a large remote file on Colab into chunks, download each, and reassemble."""
+    split_script = tmp_dir / f"split_{local_path.stem}.py"
+    remote_chunk_dir = f"/content/.dl_chunks/{local_path.stem}"
+    split_script.write_text(
+        "\n".join(
+            [
+                "import json",
+                "from pathlib import Path",
+                f"src = Path({remote_path!r})",
+                "if not src.exists():",
+                "    raise FileNotFoundError(str(src))",
+                f"out_dir = Path({remote_chunk_dir!r})",
+                "out_dir.mkdir(parents=True, exist_ok=True)",
+                f"chunk_bytes = {chunk_bytes}",
+                "parts = []",
+                "size = src.stat().st_size",
+                "with src.open('rb') as fh:",
+                "    idx = 0",
+                "    while True:",
+                "        buf = fh.read(chunk_bytes)",
+                "        if not buf:",
+                "            break",
+                "        part = out_dir / f'part_{idx:04d}'",
+                "        part.write_bytes(buf)",
+                "        parts.append(str(part))",
+                "        idx += 1",
+                f"print({DL_MANIFEST_MARKER!r} + json.dumps({{'size': size, 'parts': parts}}))",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    res = _run_colab(
+        colab_bin,
+        ["exec", "-s", session, "--timeout", "300.0", "-f", str(split_script)],
+        capture_output=True,
+    )
+    manifest: dict[str, Any] | None = None
+    for line in (res.stdout if res else "").splitlines():
+        if line.startswith(DL_MANIFEST_MARKER):
+            manifest = json.loads(line[len(DL_MANIFEST_MARKER) :])
+            break
+    if manifest is None:
+        raise RuntimeError(f"Failed to prepare chunked download for {remote_path}")
+
+    parts: list[str] = manifest["parts"]
+    expected_size = int(manifest["size"])
+    print(
+        f"[colab-process] Chunked download: {local_path.name} "
+        f"({expected_size / (1024 * 1024):.1f} MiB in {len(parts)} parts)...",
+        flush=True,
+    )
+
+    local_chunk_dir = tmp_dir / f"dl_{local_path.stem}"
+    local_chunk_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with local_path.open("wb") as out_fh:
+        for idx, remote_part in enumerate(parts):
+            local_part = local_chunk_dir / f"part_{idx:04d}"
+            for attempt in range(1, 4):
+                try:
+                    _run_colab(
+                        colab_bin,
+                        ["download", "-s", session, remote_part, str(local_part)],
+                        capture_output=True,
+                    )
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(2.0 * attempt)
+            data = local_part.read_bytes()
+            out_fh.write(data)
+            written += len(data)
+            local_part.unlink(missing_ok=True)
+            print(
+                f"[colab-process]   Downloaded part {idx + 1}/{len(parts)} "
+                f"({written / (1024 * 1024):.1f}/{expected_size / (1024 * 1024):.1f} MiB)",
+                flush=True,
+            )
+
+    if written != expected_size:
+        raise RuntimeError(
+            f"Chunked download size mismatch for {local_path}: {written} != {expected_size}"
+        )
+
+    cleanup_script = tmp_dir / f"cleanup_{local_path.stem}.py"
+    cleanup_script.write_text(
+        f"import shutil\nshutil.rmtree({remote_chunk_dir!r}, ignore_errors=True)\n",
+        encoding="utf-8",
+    )
+    try:
+        _run_colab(
+            colab_bin,
+            ["exec", "-s", session, "--timeout", "60.0", "-f", str(cleanup_script)],
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        pass
+
+
 def _download_outputs(
     colab_bin: str,
     session: str,
     cfg: dict[str, Any],
     repo_root: Path,
     dry_run: bool,
+    tmp_dir: Path | None = None,
     best_effort: bool = False,
 ) -> None:
     """Download raw CSV, smoothed CSV, and annotated video from the Colab VM."""
@@ -486,13 +686,28 @@ def _download_outputs(
                 dry_run=dry_run,
             )
         except subprocess.CalledProcessError:
-            if not best_effort:
-                raise
-            print(f"[colab-process] Note: {remote_path} not available for rescue download.")
+            if dry_run or tmp_dir is None:
+                if not best_effort:
+                    raise
+                print(f"[colab-process] Note: {remote_path} not available for rescue download.")
+                continue
+            try:
+                _download_file_chunked(
+                    colab_bin=colab_bin,
+                    session=session,
+                    remote_path=remote_path,
+                    local_path=local_path,
+                    tmp_dir=tmp_dir,
+                )
+            except (subprocess.CalledProcessError, RuntimeError):
+                if not best_effort:
+                    raise
+                print(f"[colab-process] Note: {remote_path} not available for rescue download.")
 
 
 def run_colab_processing(cfg: dict[str, Any], repo_root: Path = REPO_ROOT) -> None:
     """Execute the end-to-end Colab GPU video processing workflow."""
+    total_t0 = time.perf_counter()
     colab_bin = shutil.which(cfg["colab_bin"]) or cfg["colab_bin"]
     session = cfg["session"]
     dry_run = cfg["dry_run"]
@@ -511,6 +726,7 @@ def run_colab_processing(cfg: dict[str, Any], repo_root: Path = REPO_ROOT) -> No
 
         created_session = False
         try:
+            t_sess0 = time.perf_counter()
             if not cfg["reuse_session"]:
                 _run_colab(
                     colab_bin,
@@ -518,26 +734,39 @@ def run_colab_processing(cfg: dict[str, Any], repo_root: Path = REPO_ROOT) -> No
                     dry_run=dry_run,
                 )
                 created_session = True
+            t_sess = time.perf_counter() - t_sess0
 
-            _run_colab(
+            t_up0 = time.perf_counter()
+            _upload_file(
                 colab_bin,
-                ["upload", "-s", session, str(repo_tar), "/content/tennis_repo.tar.gz"],
+                session,
+                repo_tar,
+                "/content/tennis_repo.tar.gz",
+                tmp_dir=tmp_dir,
                 dry_run=dry_run,
             )
 
-            _run_colab(
+            _upload_file(
                 colab_bin,
-                ["upload", "-s", session, str(cfg["input_path"]), cfg["remote_input_path"]],
+                session,
+                cfg["input_path"],
+                cfg["remote_input_path"],
+                tmp_dir=tmp_dir,
                 dry_run=dry_run,
             )
 
             for local_model, remote_model in cfg["model_uploads"]:
-                _run_colab(
+                _upload_file(
                     colab_bin,
-                    ["upload", "-s", session, str(local_model), remote_model],
+                    session,
+                    local_model,
+                    remote_model,
+                    tmp_dir=tmp_dir,
                     dry_run=dry_run,
                 )
+            t_up = time.perf_counter() - t_up0
 
+            t_proc0 = time.perf_counter()
             launch_res = _run_colab(
                 colab_bin,
                 [
@@ -588,21 +817,35 @@ def run_colab_processing(cfg: dict[str, Any], repo_root: Path = REPO_ROOT) -> No
                         cfg=cfg,
                         repo_root=repo_root,
                         dry_run=False,
+                        tmp_dir=tmp_dir,
                         best_effort=True,
                     )
                     raise
+            t_proc = time.perf_counter() - t_proc0
 
+            t_dl0 = time.perf_counter()
             _download_outputs(
                 colab_bin=colab_bin,
                 session=session,
                 cfg=cfg,
                 repo_root=repo_root,
                 dry_run=dry_run,
+                tmp_dir=tmp_dir,
                 best_effort=False,
             )
+            t_dl = time.perf_counter() - t_dl0
         finally:
             if created_session and not cfg["keep_session"]:
                 _run_colab(colab_bin, ["stop", "-s", session], dry_run=dry_run)
+
+    total_s = time.perf_counter() - total_t0
+    if not dry_run:
+        print(
+            f"[colab-process] Completed in {total_s:.1f}s "
+            f"(session={t_sess:.1f}s, upload={t_up:.1f}s, "
+            f"remote_process={t_proc:.1f}s, download={t_dl:.1f}s)",
+            flush=True,
+        )
 
 
 def main() -> None:

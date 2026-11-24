@@ -123,10 +123,101 @@ class PlayerTracker:
         self._low_confidence_threshold = low_confidence_threshold
         self._max_missing_frames = max_missing_frames
 
+    def reset(self) -> None:
+        """Clear track history (e.g. after a hard camera cut between clips)."""
+        self._state = None
+
+    @staticmethod
+    def _has_nearby_racket(
+        det: PlayerDetection,
+        racket_boxes: Optional[list[BoundingBox]],
+        pad_px: float = 40.0,
+    ) -> bool:
+        if not racket_boxes:
+            return False
+        b = det.bbox
+        for rb in racket_boxes:
+            if (
+                rb.x2 >= b.x1 - pad_px
+                and rb.x1 <= b.x2 + pad_px
+                and rb.y2 >= b.y1 - pad_px
+                and rb.y1 <= b.y2 + pad_px
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _player_plausibility_score(
+        cls,
+        det: PlayerDetection,
+        court_xy: tuple[float, float],
+        racket_boxes: Optional[list[BoundingBox]] = None,
+    ) -> float:
+        """Score how plausible a person detection is as an active singles player.
+
+        Prefers high confidence, an associated tennis racket, singles-court
+        lateral positioning (penalizing sideline ballkids/umpires), and taller
+        standing silhouettes.
+        """
+        x_m, y_m = court_xy
+        score = det.confidence
+        if cls._has_nearby_racket(det, racket_boxes):
+            score += 0.50
+        # Penalize detections outside the singles sidelines (|x| > 4.5m)
+        if abs(x_m) > 4.5:
+            score -= 0.20 * (abs(x_m) - 4.5)
+        # Prefer players near the playable baseline/court zone (1.5m .. 15.5m)
+        if abs(y_m) < 1.5:
+            score -= 0.25
+        elif abs(y_m) > 15.5:
+            score -= 0.25 * (abs(y_m) - 15.5)
+        # Mild preference for taller standing silhouettes over crouched ballkids
+        score += min(det.bbox.height / 300.0, 0.35)
+        return score
+
+    @classmethod
+    def _assign_half(
+        cls,
+        candidates: list[tuple[PlayerDetection, tuple[float, float]]],
+        track: Optional[_PlayerTrackState],
+        max_match_distance: float,
+        racket_boxes: Optional[list[BoundingBox]] = None,
+    ) -> Optional[PlayerDetection]:
+        """Select at most one player for a single court half (near or far)."""
+        if not candidates:
+            return None
+
+        if track is not None:
+            nearby: list[tuple[float, float, PlayerDetection]] = []
+            for det, cxy in candidates:
+                bc = det.bbox.bottom_center
+                d = _dist(track.bottom_center_x, track.bottom_center_y, bc.x, bc.y)
+                if d <= max_match_distance:
+                    plaus = cls._player_plausibility_score(det, cxy, racket_boxes)
+                    nearby.append((d, -plaus, det))
+            if nearby:
+                # Choose closest detection within threshold (tie-broken by plausibility)
+                nearby.sort(key=lambda item: (item[0], item[1]))
+                return nearby[0][2]
+            # If the track was just seen very recently, don't immediately jump to
+            # a distant unrelated person (e.g. a ballkid) on a 1-3 frame occlusion.
+            if track.missing_frames < 4:
+                return None
+
+        # Acquiring or re-acquiring: pick the most plausible singles player in this half
+        best_det, _ = max(
+            candidates,
+            key=lambda item: cls._player_plausibility_score(item[0], item[1], racket_boxes),
+        )
+        return best_det
+
     def update(
         self,
         detections: list[PlayerDetection],
         ball: Optional[BallDetection] = None,
+        *,
+        court_positions: Optional[list[tuple[float, float]]] = None,
+        racket_boxes: Optional[list[BoundingBox]] = None,
     ) -> TrackedFrame:
         """Process one frame and return the resolved tracking output.
 
@@ -136,6 +227,15 @@ class PlayerTracker:
             Raw person detections for this frame, in any order.
         ball:
             Best ball detection for this frame, if any.
+        court_positions:
+            Optional court-plane ``(x_m, y_m)`` position for each detection in
+            ``detections``.  When supplied, enforces singles half-court
+            partitioning (Player A on the near half ``y_m < 0`` and Player B on
+            the far half ``y_m >= 0``) so non-players cannot take over the
+            opposite player's label.
+        racket_boxes:
+            Optional detected tennis racket bounding boxes used to prefer
+            racket-holding players over ballkids/officials during acquisition.
 
         Returns
         -------
@@ -143,39 +243,61 @@ class PlayerTracker:
             Resolved player and ball assignments with diagnostics.
         """
         diag = Diagnostics()
-        sorted_dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
         state = self._state
-        has_prior = state is not None and (
-            state.player_a is not None or state.player_b is not None
-        )
 
-        # --- Resolve player A/B ---
-        if len(sorted_dets) >= 2:
-            if len(sorted_dets) > 2:
+        if court_positions is not None and len(court_positions) == len(detections):
+            near_cands: list[tuple[PlayerDetection, tuple[float, float]]] = []
+            far_cands: list[tuple[PlayerDetection, tuple[float, float]]] = []
+            for det, cxy in zip(detections, court_positions):
+                if cxy[1] < 0.0:
+                    near_cands.append((det, cxy))
+                else:
+                    far_cands.append((det, cxy))
+
+            if len(near_cands) > 1 or len(far_cands) > 1:
                 diag.add_flag("ambigous_player_id")
 
-            if has_prior:
-                assert state is not None
-                a_det, b_det = self._assign_by_proximity(
-                    sorted_dets,
-                    state,
-                    self._max_match_distance,
-                )
-            else:
-                # No prior state — assign top two by confidence
-                chosen = sorted_dets[:2]
-                a_det, b_det = chosen[0], chosen[1]
-
-        elif len(sorted_dets) == 1:
-            det = sorted_dets[0]
-            if has_prior:
-                assert state is not None
-                a_det, b_det = self._assign_single(det, state, self._max_match_distance)
-            else:
-                a_det, b_det = det, None
-
+            prev_a = state.player_a if state is not None else None
+            prev_b = state.player_b if state is not None else None
+            a_det = self._assign_half(
+                near_cands, prev_a, self._max_match_distance, racket_boxes=racket_boxes
+            )
+            b_det = self._assign_half(
+                far_cands, prev_b, self._max_match_distance, racket_boxes=racket_boxes
+            )
         else:
-            a_det, b_det = None, None
+            sorted_dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
+            has_prior = state is not None and (
+                state.player_a is not None or state.player_b is not None
+            )
+
+            # --- Resolve player A/B ---
+            if len(sorted_dets) >= 2:
+                if len(sorted_dets) > 2:
+                    diag.add_flag("ambigous_player_id")
+
+                if has_prior:
+                    assert state is not None
+                    a_det, b_det = self._assign_by_proximity(
+                        sorted_dets,
+                        state,
+                        self._max_match_distance,
+                    )
+                else:
+                    # No prior state — assign top two by confidence
+                    chosen = sorted_dets[:2]
+                    a_det, b_det = chosen[0], chosen[1]
+
+            elif len(sorted_dets) == 1:
+                det = sorted_dets[0]
+                if has_prior:
+                    assert state is not None
+                    a_det, b_det = self._assign_single(det, state, self._max_match_distance)
+                else:
+                    a_det, b_det = det, None
+
+            else:
+                a_det, b_det = None, None
 
         if a_det is None:
             diag.add_flag("missing_player_a")

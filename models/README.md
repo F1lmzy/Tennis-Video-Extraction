@@ -10,7 +10,8 @@ Only this README is versioned.
 | File Pattern | Model Type | Task |
 |---|---|---|
 | `player_*.pt` | YOLO26 detection | Player (person) detection |
-| `ball_*.pt` | YOLO26 detection | Ball detection |
+| `balltrack_best.pth` | TrackNetV3 heatmap | Multi-frame ball detection (default, RacketVision) |
+| `ball_*.pt` | YOLO26 detection | Single-frame ball detection (fallback) |
 | `court_keypoints_*.pt` | YOLO26 pose | Court keypoint detection |
 | `*.onnx` | ONNX export | CPU-optimized inference |
 | `*_openvino/` | OpenVINO IR | CPU-optimized inference |
@@ -103,6 +104,7 @@ The `.gitignore` file covers these patterns for this directory:
 
 ```gitignore
 models/*.pt
+models/*.pth
 models/*.onnx
 models/*.xml
 models/*.bin

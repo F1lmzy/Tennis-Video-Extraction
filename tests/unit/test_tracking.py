@@ -692,3 +692,68 @@ class TestSelectBestBall:
         cleaned = filter_static_ball_hotspots(frames_dets[10], hotspots)
         assert len(cleaned) == 1
         assert cleaned[0].center.x == pytest.approx(600.0)
+
+
+class TestHalfCourtPlayerTracking:
+    """Tests for court-plane half partitioning (near=A, far=B) and cut resets."""
+
+    def test_enforces_one_near_and_one_far_player(self) -> None:
+        """Even if a ballkid on the near side has higher conf, far player gets B."""
+        tracker = PlayerTracker()
+        near_player = _player(300, 450, 360, 610, confidence=0.92)
+        near_ballkid = _player(550, 500, 590, 570, confidence=0.88)
+        far_player = _player(680, 140, 720, 220, confidence=0.40)
+
+        res = tracker.update(
+            [near_player, near_ballkid, far_player],
+            court_positions=[(-3.0, -12.0), (5.8, -11.0), (1.0, 11.5)],
+        )
+        assert res.player_a is near_player
+        assert res.player_b is far_player
+        assert res.diagnostics.has_flag("ambigous_player_id")
+
+    def test_ballkid_on_far_half_does_not_steal_active_far_player(self) -> None:
+        """Active far player track stays locked when a ballkid enters the far half."""
+        tracker = PlayerTracker()
+        near_p = _player(300, 450, 360, 610, confidence=0.91)
+        far_p = _player(700, 140, 740, 220, confidence=0.90)
+        tracker.update([near_p, far_p], court_positions=[(-3.5, -13.0), (1.5, 11.6)])
+
+        # Frame 2: ballkid runs into far half at x=520 with slightly higher confidence
+        far_p_next = _player(705, 142, 745, 222, confidence=0.85)
+        ballkid = _player(510, 175, 546, 247, confidence=0.93)
+        res = tracker.update(
+            [near_p, ballkid, far_p_next],
+            court_positions=[(-3.5, -13.0), (-2.3, 8.7), (1.6, 11.5)],
+        )
+        assert res.player_a is near_p
+        assert res.player_b is far_p_next
+
+    def test_racket_bonus_prefers_player_over_ballkid_on_acquisition(self) -> None:
+        """When acquiring a half with two people, prefer the one holding a racket."""
+        tracker = PlayerTracker()
+        near_p = _player(300, 450, 360, 610, confidence=0.90)
+        far_player = _player(700, 140, 740, 220, confidence=0.82)
+        far_ballkid = _player(510, 175, 546, 247, confidence=0.90)
+        racket = BoundingBox(735, 160, 765, 195)
+
+        res = tracker.update(
+            [near_p, far_ballkid, far_player],
+            court_positions=[(-3.5, -13.0), (-2.3, 8.7), (1.6, 11.5)],
+            racket_boxes=[racket],
+        )
+        assert res.player_a is near_p
+        assert res.player_b is far_player
+
+    def test_reset_clears_history_across_camera_cut(self) -> None:
+        """After reset(), tracker immediately acquires players at new camera coordinates."""
+        tracker = PlayerTracker()
+        tracker.update(
+            [_player(750, 400, 810, 470, confidence=0.9)],
+            court_positions=[(3.5, -13.0)],
+        )
+        tracker.reset()
+        new_near = _player(250, 500, 320, 660, confidence=0.9)
+        res = tracker.update([new_near], court_positions=[(-4.0, -13.5)])
+        assert res.player_a is new_near
+

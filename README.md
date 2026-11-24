@@ -32,7 +32,8 @@ uv run python -m tennis_tracker --help
 
 - **Python 3.11+**
 - **uv** (package manager) — install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`
-- **Apple M-series Mac** recommended for production use (standard M1 target)
+- **ffmpeg / ffprobe** — required for full-match preprocessing and MP4 conversion (`brew install ffmpeg`)
+- **Apple M-series Mac** recommended for local use, or **Google Colab CLI (`colab`)** for GPU processing
 - **Roboflow API key** only needed for dataset download (see Dataset Preparation)
 
 ## Project Structure
@@ -43,13 +44,18 @@ tennis-video-extraction/
     spec.md                    # Full specification
     implementation-plan.md     # Implementation plan
   data/
-    input/                     # Local input videos (gitignored)
+    input/                     # Local input & preprocessed *-trimmed.mp4 videos (gitignored)
     output/                    # Generated CSV/video outputs (gitignored)
     datasets/                  # Downloaded/exported datasets (gitignored)
   models/
     README.md                  # Model artifact documentation
   scripts/
+    preprocess_video.py        # Full-match court-keypoint trimmer & MP4 converter (ffmpeg)
+    download_tracknet_checkpoint.py  # Download RacketVision TrackNetV3 ball checkpoint
     prepare_roboflow_dataset.py
+    process_on_colab.py        # Colab GPU runner with chunked upload/download
+    process_video.sh           # Wrapper for Colab GPU processing
+    train_on_colab.py          # Colab GPU training runner
   src/
     tennis_tracker/
       __init__.py
@@ -61,13 +67,16 @@ tennis-video-extraction/
       court.py                 # Court geometry constants
       coordinates.py           # Homography and projection
       smoothing.py             # Temporal interpolation
+      ballistics.py            # 3D ball elevation & bounce/hit reconstruction
       video.py                 # Video IO utilities
+      preprocess.py            # Coarse-to-fine court visibility trimming engine
       pipeline.py              # Process pipeline
       detection.py             # YOLO inference wrappers
-      tracking.py              # Player/ball tracking assignment
+      tracknet.py              # Pure-PyTorch TrackNetV3 multi-frame ball tracker
+      tracking.py              # Half-court player & ball tracking assignment
       optimization.py          # Model export/optimization workflow
       benchmark.py             # Benchmark reporting
-      render.py                # Annotated video rendering
+      render.py                # Annotated 2D + 3D video rendering
       validation.py            # Validation metrics
       training/
         __init__.py
@@ -188,46 +197,87 @@ Supported formats: `onnx`, `openvino`. Supported quantization: `int8`, `fp16`.
 
 When `--auto-optimize-models` is enabled (default) in the `process` command, the pipeline detects missing or stale optimized artifacts, exports and benchmarks ONNX/OpenVINO variants, and selects the fastest valid artifact. Falls back to the original `.pt` file if needed.
 
+## Ball Tracking Model (TrackNetV3)
+
+For significantly higher ball detection recall (including fast serves, slow serve tosses, and near-player hits), the pipeline integrates **TrackNetV3** from [OrcustD/RacketVision](https://github.com/OrcustD/RacketVision) in pure PyTorch (no `mmengine` required). It takes a median background frame plus 4 consecutive frames at `512 × 288` and predicts a per-pixel ball heatmap.
+
+Download the pretrained checkpoint (`models/balltrack_best.pth`, ~44 MiB) from Hugging Face (`linfeng302/RacketVision-Models`):
+
+```bash
+uv run python scripts/download_tracknet_checkpoint.py
+```
+
+When `--ball-backend auto` (default) is used, `.pth` checkpoints automatically run with TrackNetV3 (default `--ball-conf 0.5`) and `.pt` checkpoints run with YOLO (default `--ball-conf 0.05`).
+
+## Preprocessing Full Match Videos
+
+Full broadcast recordings (e.g. `.mkv` files containing commercials, close-ups, replays, and changeovers) can be trimmed down to only the clips where **all 15 court keypoints** are visible and converted to `.mp4` via `ffmpeg`:
+
+```bash
+# Trim a full match recording -> data/input/game-full-trimmed.mp4
+uv run python scripts/preprocess_video.py data/input/game-full.mkv
+
+# Or via the package CLI
+uv run python -m tennis_tracker preprocess --input data/input/game-full.mkv
+
+# Preview detected clips without exporting video
+uv run python scripts/preprocess_video.py data/input/game-full.mkv --dry-run
+
+# Tune workers or save individual clip MP4s and segment timestamps
+uv run python scripts/preprocess_video.py data/input/game-full.mkv \
+  --workers 4 \
+  --segments-json data/input/game-full-segments.json
+```
+
+How preprocessing stays fast on long recordings:
+1. **Coarse scan:** Streams downscaled frames from `ffmpeg` at 1 fps (configurable via `--sample-interval`) with batched court-keypoint inference.
+2. **Binary-search boundary refinement:** Fast-seeks to each camera transition and locates the exact start/end frame in `O(log N)` inferences per cut.
+3. **Parallel fast-seek MP4 export:** Encodes only kept full-court segments in parallel (preferring `h264_videotoolbox` on macOS, falling back to `libx264`) and stitches them losslessly into `data/input/<stem>-trimmed.mp4`.
+
 ## Processing a Video
 
 ### On Google Colab GPU (recommended for faster inference)
 
 ```bash
-# Default input (data/input/match.mp4) on a Colab T4 GPU
+# Default input (data/input/match.mp4) on a Colab T4 GPU with TrackNetV3 + 3D view
 ./scripts/process_video.sh
 
-# Add the 3D corner view below the match footage and 2D court
-./scripts/process_video.sh data/input/match.mp4 --3d-court-view
-./scripts/process_video.sh data/input/match.mp4 --3d --gpu L4
+# Process a trimmed full match or rally clip
+./scripts/process_video.sh data/input/game-full-trimmed.mp4
+./scripts/process_video.sh data/input/match-2.mp4 --gpu L4
+
+# Optional flags: disable 3D view or fall back to the YOLO ball model
+./scripts/process_video.sh data/input/match-2.mp4 --no-3d
+./scripts/process_video.sh data/input/match-2.mp4 --yolo-ball
 
 # Dry-run without allocating a VM
-./scripts/process_video.sh data/input/match.mp4 --dry-run
+./scripts/process_video.sh data/input/match-2.mp4 --dry-run
 ```
 
-`scripts/process_video.sh` wraps `scripts/process_on_colab.py`, which uploads the video and local models (`yolo26n.pt`, `models/ball_yolo26.pt`, `models/court_keypoints_yolo26.pt`) to a Colab GPU session, runs `tennis_tracker process --device cuda` detached while polling logs, downloads the CSVs and annotated MP4 back to `data/output/`, and stops the session automatically.
+`scripts/process_video.sh` wraps `scripts/process_on_colab.py`, which uploads the video and local models (`yolo26n.pt`, `models/balltrack_best.pth` or `models/ball_yolo26.pt`, `models/court_keypoints_yolo26.pt`) using automatic 15 MiB chunked transfers for large files, runs `tennis_tracker process --device cuda --3d-court-view` detached while polling logs (preserving native video FPS), downloads the CSVs and annotated MP4 back to `data/output/`, and stops the session automatically.
 
 ### Locally (CPU / MPS)
 
 ```bash
 uv run python -m tennis_tracker process \
-  --input data/input/match.mp4 \
-  --raw-output data/output/match_raw_coordinates.csv \
-  --smoothed-output data/output/match_smoothed_coordinates.csv \
-  --video-output data/output/match_annotated.mp4 \
-  --player-model models/player_yolo26.pt \
-  --ball-model models/ball_yolo26.pt \
+  --input data/input/match-2.mp4 \
+  --raw-output data/output/match-2_raw_coordinates.csv \
+  --smoothed-output data/output/match-2_smoothed_coordinates.csv \
+  --video-output data/output/match-2_annotated.mp4 \
+  --player-model yolo26n.pt \
+  --ball-model models/balltrack_best.pth \
   --court-model models/court_keypoints_yolo26.pt \
   --device cpu \
-  --target-fps 30
+  --3d-court-view
 ```
 
 The pipeline:
 
-1. Loads models (or optimized artifacts)
-2. For each frame: detects court keypoints, estimates homography, detects players and ball, tracks player labels, projects to court-plane coordinates
+1. Loads models (YOLO for players/court keypoints, TrackNetV3 or YOLO for the ball)
+2. For each frame: detects court keypoints with cut-aware sign-aligned homography stabilization, detects players and the ball, enforces near/far half-court player tracking (filtering out umpires, camera operators, and ballkids), and projects to court-plane coordinates
 3. Writes raw CSV (unsmoothed per-frame detections)
-4. Fills short tracking gaps, estimates ball height using detected bounces and hits, and writes the corrected court coordinates to the smoothed CSV
-5. Renders the annotated video in a 16:9 layout
+4. Fills short tracking gaps, estimates 3D ball height using detected bounces and hits, and writes the corrected court coordinates to the smoothed CSV
+5. Renders the annotated video in a 16:9 layout with 2D top-down court and optional 3D corner view
 
 **Missing/low-confidence detections** produce diagnostic flags rather than crashes or fabricated coordinates.
 
@@ -340,7 +390,7 @@ uv run ruff check --fix .
 The following are gitignored and **not committed** to the repository:
 
 - `data/input/`, `data/output/`, `data/datasets/` — large data files
-- `models/*.pt`, `models/*.onnx`, `models/*.xml`, `models/*.bin` — model weights
+- `models/*.pt`, `models/*.pth`, `models/*.onnx`, `models/*.xml`, `models/*.bin` — model weights
 - `__pycache__/`, `.venv/` — Python build artifacts
 - `.env` — credentials and secrets
 - `htmlcov/`, `.coverage*` — test coverage reports

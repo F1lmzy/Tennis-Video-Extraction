@@ -367,13 +367,14 @@ def run_process(
     court_detector=None,
     player_model_path: Optional[str | Path] = None,
     ball_model_path: Optional[str | Path] = None,
+    ball_backend: str = "auto",
     court_model_path: Optional[str | Path] = None,
     fps: Optional[float] = None,
     smoothing_max_gap: int = 10,
     homography_every_frame: bool = True,
     homography_ema_alpha: float = 0.35,
     player_conf: float = 0.25,
-    ball_conf: float = 0.05,
+    ball_conf: Optional[float] = None,
     court_conf: float = 0.25,
     imgsz: Optional[int] = None,
     device: Optional[str] = None,
@@ -464,17 +465,35 @@ def run_process(
         from tennis_tracker.detection import PlayerDetector
         player_detector = PlayerDetector(model_path=player_model_path)
     if ball_detector is None and ball_model_path is not None:
-        from tennis_tracker.detection import BallDetector
-        ball_detector = BallDetector(model_path=ball_model_path)
+        backend = ball_backend.lower()
+        if backend == "auto":
+            backend = "tracknet" if Path(ball_model_path).suffix.lower() == ".pth" else "yolo"
+        if backend == "tracknet":
+            from tennis_tracker.tracknet import TrackNetBallDetector
+
+            ball_detector = TrackNetBallDetector(model_path=ball_model_path, device=device)
+            try:
+                ball_detector.set_median_from_video(video_path)
+            except (FileNotFoundError, ValueError):
+                pass
+        else:
+            from tennis_tracker.detection import BallDetector
+
+            ball_detector = BallDetector(model_path=ball_model_path)
     if court_detector is None and court_model_path is not None:
         from tennis_tracker.detection import CourtKeypointDetector
         court_detector = CourtKeypointDetector(model_path=court_model_path)
+
+    is_temporal_ball = getattr(ball_detector, "is_temporal", False) is True
+    if ball_conf is None:
+        ball_conf = 0.5 if is_temporal_ball else 0.05
 
     # ── State ──
     tracker = PlayerTracker()
     raw_rows: list[OutputRow] = []
     homography_matrix = None
     prev_homography_matrix = None
+    pending_cut_h: Optional[np.ndarray] = None
     camera_pos: Optional[tuple[float, float, float]] = None
     camera_positions_per_frame: list[Optional[tuple[float, float, float]]] = []
     homography_valid = False
@@ -489,43 +508,108 @@ def run_process(
     homographies_per_frame: list[Optional[np.ndarray]] = []
     base_diagnostics_per_frame: list[Diagnostics] = []
 
+    def _normalize_h(h: np.ndarray) -> Optional[np.ndarray]:
+        """Scale-normalize a 3x3 homography by Frobenius norm (never by H[2,2])."""
+        mat = h.astype(np.float64)
+        norm = float(np.linalg.norm(mat))
+        if not np.isfinite(norm) or norm < 1e-12:
+            return None
+        return mat / norm
+
+    def _court_shift_px(h1: np.ndarray, h2: np.ndarray) -> Optional[float]:
+        """Mean pixel displacement of court center and corners between two homographies."""
+        try:
+            inv1 = np.linalg.inv(h1)
+            inv2 = np.linalg.inv(h2)
+        except np.linalg.LinAlgError:
+            return None
+        probe_pts = (
+            (0.0, 0.0),
+            (-5.485, -11.885),
+            (5.485, -11.885),
+            (-5.485, 11.885),
+            (5.485, 11.885),
+        )
+        shifts: list[float] = []
+        for cx, cy in probe_pts:
+            v = np.array([cx, cy, 1.0], dtype=np.float64)
+            p1 = inv1 @ v
+            p2 = inv2 @ v
+            if abs(p1[2]) < 1e-8 or abs(p2[2]) < 1e-8:
+                return None
+            dx = p1[0] / p1[2] - p2[0] / p2[2]
+            dy = p1[1] / p1[2] - p2[1] / p2[2]
+            shifts.append(float(np.hypot(dx, dy)))
+        return float(np.mean(shifts))
+
+    def _court_orientation_sign(h: np.ndarray) -> Optional[float]:
+        """Projectively invariant orientation sign of the court in pixel coordinates."""
+        try:
+            inv_h = np.linalg.inv(h)
+        except np.linalg.LinAlgError:
+            return None
+        pts = []
+        for cx, cy in ((-5.485, -11.885), (5.485, -11.885), (-5.485, 11.885)):
+            p = inv_h @ np.array([cx, cy, 1.0], dtype=np.float64)
+            if abs(p[2]) < 1e-8:
+                return None
+            pts.append((p[0] / p[2], p[1] / p[2]))
+        vx, vy = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+        wx, wy = pts[2][0] - pts[0][0], pts[2][1] - pts[0][1]
+        return float(vx * wy - vy * wx)
+
     def _smooth_homography(
         prev_h: Optional[np.ndarray],
         new_h: np.ndarray,
         alpha: float,
-    ) -> Optional[np.ndarray]:
-        """Validate and EMA-smooth a per-frame court homography."""
-        if abs(float(new_h[2, 2])) < 1e-12:
-            return prev_h
-        cand = new_h.astype(np.float64) / float(new_h[2, 2])
+        *,
+        high_conf_cut: bool = False,
+    ) -> tuple[Optional[np.ndarray], bool]:
+        """Validate, cut-detect, and sign-aligned EMA-smooth a court homography.
+
+        Returns ``(updated_homography, is_camera_cut)``.
+        """
+        nonlocal pending_cut_h
+        cand = _normalize_h(new_h)
+        if cand is None:
+            return prev_h, False
         if prev_h is None:
-            return cand
+            pending_cut_h = None
+            return cand, False
+
         # Reject single-frame orientation flips (e.g. mirrored keypoints)
-        prev_det = float(np.linalg.det(prev_h[:2, :2]))
-        cand_det = float(np.linalg.det(cand[:2, :2]))
-        if prev_det * cand_det <= 0:
-            return prev_h
-        # Reject implausible single-frame jumps in projected court center
-        try:
-            prev_inv = np.linalg.inv(prev_h)
-            cand_inv = np.linalg.inv(cand)
-        except np.linalg.LinAlgError:
-            return prev_h
-        p_prev = prev_inv @ np.array([0.0, 0.0, 1.0])
-        p_cand = cand_inv @ np.array([0.0, 0.0, 1.0])
-        if abs(p_prev[2]) > 1e-8 and abs(p_cand[2]) > 1e-8:
-            jump_px = float(
-                np.hypot(
-                    p_prev[0] / p_prev[2] - p_cand[0] / p_cand[2],
-                    p_prev[1] / p_prev[2] - p_cand[1] / p_cand[2],
-                )
-            )
-            if jump_px > 120.0:
-                return prev_h
+        prev_ori = _court_orientation_sign(prev_h)
+        cand_ori = _court_orientation_sign(cand)
+        if prev_ori is not None and cand_ori is not None and prev_ori * cand_ori <= 0.0:
+            return prev_h, False
+
+        shift_px = _court_shift_px(prev_h, cand)
+        if shift_px is None:
+            return prev_h, False
+
+        if shift_px > 120.0:
+            # Handle real camera/clip cuts cleanly instead of freezing forever
+            if high_conf_cut:
+                pending_cut_h = None
+                return cand, True
+            if pending_cut_h is not None:
+                pending_shift = _court_shift_px(pending_cut_h, cand)
+                if pending_shift is not None and pending_shift <= 80.0:
+                    pending_cut_h = None
+                    return cand, True
+            pending_cut_h = cand
+            return prev_h, False
+
+        pending_cut_h = None
+        # Sign-align cand with prev_h (H and -H are identical in projective space;
+        # blending opposite signs cancels the matrix and corrupts projection!)
+        if float(np.sum(cand * prev_h)) < 0.0:
+            cand = -cand
         blended = alpha * cand + (1.0 - alpha) * prev_h
-        if abs(float(blended[2, 2])) < 1e-12:
-            return prev_h
-        return blended / float(blended[2, 2])
+        blended_norm = _normalize_h(blended)
+        if blended_norm is None:
+            return prev_h, False
+        return blended_norm, False
 
     def _deduplicate_players(dets: list, min_foot_dist_px: float = 35.0) -> list:
         """Drop duplicate overlapping person boxes on the same player."""
@@ -550,6 +634,7 @@ def run_process(
         time_s = frame_index / fps if fps and fps > 0 else 0.0
 
         # ── Court keypoint detection and homography ──
+        is_camera_cut = False
         if court_detector is not None and (
             not first_frame_processed or homography_every_frame
         ):
@@ -573,15 +658,29 @@ def run_process(
                     result = estimate_homography(pixel_pts, court_pts)
                     if result.valid and result.matrix is not None:
                         if result.reprojection_error_px <= 15.0 or homography_matrix is None:
-                            updated_h = _smooth_homography(
+                            high_conf_cut = (
+                                result.num_matches >= 8
+                                and result.confidence >= 0.85
+                                and (result.reprojection_error_px or 99.0) <= 1.5
+                            )
+                            updated_h, is_camera_cut = _smooth_homography(
                                 homography_matrix,
                                 result.matrix,
                                 homography_ema_alpha,
+                                high_conf_cut=high_conf_cut,
                             )
                             if updated_h is not None:
                                 homography_matrix = updated_h
                                 court_confidence = result.confidence
                                 homography_valid = True
+                                if is_camera_cut:
+                                    # Reset temporal state across hard clip/camera cuts
+                                    camera_pos = None
+                                    prev_homography_matrix = None
+                                    previous_frame_bgr = None
+                                    tracker.reset()
+                                    if hasattr(ball_detector, "reset"):
+                                        ball_detector.reset()
                                 # Re-estimate camera pose periodically to track
                                 # broadcast pan/zoom (a frame-0-only pose drifts
                                 # several meters over a clip, biasing heights).
@@ -669,8 +768,10 @@ def run_process(
         # baseline while ballkids/linesmen sit further back.
         deduped_player_dets = _deduplicate_players(player_dets)
         filtered_player_dets = deduped_player_dets
+        filtered_court_positions: Optional[list[tuple[float, float]]] = None
         if homography_matrix is not None:
             filtered_player_dets = []
+            filtered_court_positions = []
             half_width = DOUBLES_WIDTH / 2.0 + player_court_margin_m
             half_length = DOUBLES_LENGTH / 2.0 + player_baseline_margin_m
             for det in deduped_player_dets:
@@ -687,9 +788,15 @@ def run_process(
                     and -half_length <= court_point.y_m <= half_length
                 ):
                     filtered_player_dets.append(det)
+                    filtered_court_positions.append((court_point.x_m, court_point.y_m))
 
-        # ── Track players ──
-        tracked = tracker.update(filtered_player_dets, ball=None)
+        # ── Track players (enforcing 1 near-court + 1 far-court when calibrated) ──
+        tracked = tracker.update(
+            filtered_player_dets,
+            ball=None,
+            court_positions=filtered_court_positions,
+            racket_boxes=racket_boxes,
+        )
 
         # ── Project players to court coordinates ──
         def _project_with_h(
@@ -767,7 +874,9 @@ def run_process(
             print(f"[process] Processed {idx + 1}{suffix} frames...", flush=True)
 
     # ── Pass 2: Static-hotspot masking + velocity-predicted ball tracking ──
-    static_hotspots = find_static_ball_hotspots(raw_ball_dets_per_frame)
+    static_hotspots = (
+        [] if is_temporal_ball else find_static_ball_hotspots(raw_ball_dets_per_frame)
+    )
     selected_balls_per_frame: list = []
     ball_candidates_per_frame: list[list] = []
     previous_ball = None
@@ -792,44 +901,50 @@ def run_process(
                 y=previous_ball.center.y + previous_ball_vel[1] * dt,
             )
 
-        cleaned_dets = filter_static_ball_hotspots(raw_dets, static_hotspots)
-        if (
-            previous_ball is not None
-            and predicted_center is not None
-            and ball_missing_frames <= 1
-            and len(cleaned_dets) < len(raw_dets)
-        ):
-            # A hotspot can lie on a real flight path. Keep the mask for acquisition,
-            # but let moving observations near a recent track's prediction through.
-            unmasked = set(cleaned_dets)
-            radius = min(_HOTSPOT_CONTINUATION_RADIUS_PX, ball_max_jump_px)
-            cleaned_dets = [
+        if is_temporal_ball:
+            # Multi-frame heatmap trackers (e.g. TrackNetV3) already suppress
+            # static background artifacts via median background concatenation,
+            # so avoid dropping slow serve-toss apexes or player-overlapping balls.
+            moving_dets = list(raw_dets)
+        else:
+            cleaned_dets = filter_static_ball_hotspots(raw_dets, static_hotspots)
+            if (
+                previous_ball is not None
+                and predicted_center is not None
+                and ball_missing_frames <= 1
+                and len(cleaned_dets) < len(raw_dets)
+            ):
+                # A hotspot can lie on a real flight path. Keep the mask for acquisition,
+                # but let moving observations near a recent track's prediction through.
+                unmasked = set(cleaned_dets)
+                radius = min(_HOTSPOT_CONTINUATION_RADIUS_PX, ball_max_jump_px)
+                cleaned_dets = [
+                    det
+                    for det in raw_dets
+                    if det in unmasked or (
+                        motions[det] > 0.0
+                        and motions[det] >= ball_motion_threshold
+                        and ball_center_distance(det, previous_ball) >= _HOTSPOT_MIN_DISPLACEMENT_PX
+                        and np.hypot(
+                            det.center.x - predicted_center.x, det.center.y - predicted_center.y
+                        ) <= radius
+                    )
+                ]
+
+            # On active tracks, allow a softer motion floor for high-confidence
+            # detections while still rejecting static zero-motion artifacts by default.
+            moving_dets = [
                 det
-                for det in raw_dets
-                if det in unmasked or (
-                    motions[det] > 0.0
-                    and motions[det] >= ball_motion_threshold
-                    and ball_center_distance(det, previous_ball) >= _HOTSPOT_MIN_DISPLACEMENT_PX
-                    and np.hypot(
-                        det.center.x - predicted_center.x, det.center.y - predicted_center.y
-                    ) <= radius
+                for det in cleaned_dets
+                if (
+                    motions.get(det, 0.0) >= ball_motion_threshold
+                    or (
+                        previous_ball is not None
+                        and det.confidence >= 0.45
+                        and motions.get(det, 0.0) >= min(ball_motion_threshold * 0.4, 0.8)
+                    )
                 )
             ]
-
-        # On active tracks, allow a softer motion floor for high-confidence
-        # detections while still rejecting static zero-motion artifacts by default.
-        moving_dets = [
-            det
-            for det in cleaned_dets
-            if (
-                motions.get(det, 0.0) >= ball_motion_threshold
-                or (
-                    previous_ball is not None
-                    and det.confidence >= 0.45
-                    and motions.get(det, 0.0) >= min(ball_motion_threshold * 0.4, 0.8)
-                )
-            )
-        ]
         ball_candidates_per_frame.append(moving_dets)
 
         if previous_ball is not None:
@@ -866,6 +981,12 @@ def run_process(
             _anc=anchor_pt,
             _lim=effective_max_jump,
         ):
+            if is_temporal_ball:
+                total = det.confidence
+                if _anc is not None:
+                    dist = ((det.center.x - _anc.x) ** 2 + (det.center.y - _anc.y) ** 2) ** 0.5
+                    total += 0.45 * max(0.0, 1.0 - dist / _lim)
+                return total
             m_val = _motions.get(det, 0.0)
             m_norm = 1.0 if m_val == float("inf") else min(m_val / 25.0, 1.0)
             total = det.confidence + 0.35 * m_norm
@@ -879,7 +1000,7 @@ def run_process(
         ball_candidate = max(cands, key=_score_cand) if cands else None
         best_ball = ball_candidate
 
-        if previous_ball is None:
+        if previous_ball is None and not is_temporal_ball:
             best_ball = None
             if ball_candidate is not None:
                 if pending_ball is not None:

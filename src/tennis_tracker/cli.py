@@ -25,7 +25,15 @@ def main() -> None:
         "--player-model", default="yolo26n.pt", help="Player detection model path"
     )
     process_parser.add_argument(
-        "--ball-model", default="yolo26n.pt", help="Ball detection model path"
+        "--ball-model",
+        default="yolo26n.pt",
+        help="Ball detection model path (.pt YOLO or .pth TrackNetV3)",
+    )
+    process_parser.add_argument(
+        "--ball-backend",
+        choices=["auto", "tracknet", "yolo"],
+        default="auto",
+        help="Ball detector backend (default: auto-detect .pth as TrackNetV3, .pt as YOLO)",
     )
     process_parser.add_argument(
         "--court-model", default="yolo26n-pose.pt", help="Court keypoint model path"
@@ -34,7 +42,10 @@ def main() -> None:
         "--device", default="cpu", help="Inference device (cpu, mps, cuda)"
     )
     process_parser.add_argument(
-        "--target-fps", type=int, default=30, help="Target processing FPS"
+        "--target-fps",
+        type=float,
+        default=None,
+        help="Target processing FPS (default: preserve input video FPS)",
     )
     process_parser.add_argument(
         "--input-resolution", default="1080p", help="Input video resolution"
@@ -66,8 +77,8 @@ def main() -> None:
     process_parser.add_argument(
         "--ball-conf",
         type=float,
-        default=0.05,
-        help="Ball detection confidence threshold",
+        default=None,
+        help="Ball detection confidence threshold (default: 0.5 for TrackNetV3, 0.05 for YOLO)",
     )
     process_parser.add_argument(
         "--court-conf",
@@ -218,6 +229,58 @@ def main() -> None:
         "--quantize", choices=["int8", "fp16"], help="Quantization type"
     )
 
+    # --- preprocess ---
+    preprocess_parser = subparsers.add_parser(
+        "preprocess",
+        help="Trim a match video to keep only full-court clips and convert to MP4",
+    )
+    preprocess_parser.add_argument("--input", required=True, help="Path to input video")
+    preprocess_parser.add_argument(
+        "--output-dir",
+        default="data/input",
+        help="Output directory for *-trimmed.mp4 (default: data/input)",
+    )
+    preprocess_parser.add_argument(
+        "--court-model",
+        default="models/court_keypoints_yolo26.pt",
+        help="Court keypoint model path",
+    )
+    preprocess_parser.add_argument(
+        "--court-conf",
+        type=float,
+        default=0.5,
+        help="Minimum confidence required for every court keypoint",
+    )
+    preprocess_parser.add_argument(
+        "--sample-interval",
+        type=float,
+        default=1.0,
+        help="Coarse scan sampling interval in seconds",
+    )
+    preprocess_parser.add_argument(
+        "--min-clip-s",
+        type=float,
+        default=2.0,
+        help="Minimum kept clip duration in seconds",
+    )
+    preprocess_parser.add_argument(
+        "--max-gap-s",
+        type=float,
+        default=0.0,
+        help="Maximum gap in seconds to bridge between adjacent court segments",
+    )
+    preprocess_parser.add_argument(
+        "--device", default="cpu", help="Inference device (cpu, mps, cuda)"
+    )
+    preprocess_parser.add_argument(
+        "--imgsz", type=int, default=640, help="YOLO inference image size"
+    )
+    preprocess_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Detect segments without exporting video",
+    )
+
     # --- validate ---
     validate_parser = subparsers.add_parser(
         "validate", help="Validate model accuracy against ground truth"
@@ -248,6 +311,8 @@ def main() -> None:
         _handle_benchmark(args)
     elif args.command == "optimize-model":
         _handle_optimize(args)
+    elif args.command == "preprocess":
+        _handle_preprocess(args)
     elif args.command == "validate":
         _handle_validate(args)
 
@@ -274,6 +339,7 @@ def _handle_process(args: argparse.Namespace) -> None:
         video_output_path=video_out,
         player_model_path=args.player_model,
         ball_model_path=args.ball_model,
+        ball_backend=args.ball_backend,
         court_model_path=args.court_model,
         fps=args.target_fps,
         player_conf=args.player_conf,
@@ -348,6 +414,32 @@ def _handle_optimize(args: argparse.Namespace) -> None:
     print(f"  Diagnostics: {result.diagnostics}")
     for art in result.artifacts:
         print(f"  - [{art.status}] {art.export_format}: {art.diagnostics}")
+
+
+def _handle_preprocess(args: argparse.Namespace) -> None:
+    """Run court-keypoint-based video trimming and MP4 conversion."""
+    from tennis_tracker.preprocess import PreprocessConfig, preprocess_video
+
+    config = PreprocessConfig(
+        court_model_path=Path(args.court_model),
+        output_dir=Path(args.output_dir),
+        conf_threshold=args.court_conf,
+        sample_interval_s=args.sample_interval,
+        min_clip_s=args.min_clip_s,
+        max_gap_s=args.max_gap_s,
+        imgsz=args.imgsz,
+        device=args.device,
+        dry_run=args.dry_run,
+    )
+    result = preprocess_video(
+        args.input,
+        config=config,
+        progress_callback=lambda msg: print(msg, flush=True),
+    )
+    print(f"  Source duration: {result.source_duration_s:.1f}s")
+    print(f"  Kept duration:   {result.kept_duration_s:.1f}s ({len(result.segments)} clips)")
+    print(f"  Removed:         {result.removed_duration_s:.1f}s")
+    print(f"  Output MP4:      {result.output_path}")
 
 
 def _handle_validate(args: argparse.Namespace) -> None:

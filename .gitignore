@@ -24,6 +24,7 @@ data/datasets/
 runs/
 *.pt
 models/*.pt
+models/*.pth
 models/*.onnx
 models/*.xml
 models/*.bin

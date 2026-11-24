@@ -352,6 +352,64 @@ class CourtKeypointDetector:
         """The underlying YOLO model instance (exposed for testing)."""
         return self._model
 
+    @property
+    def expected_keypoint_count(self) -> int:
+        """Return the expected total number of court keypoints for this model."""
+        inner = getattr(self._model, "model", None)
+        kpt_shape = getattr(inner, "kpt_shape", None)
+        if kpt_shape is not None and len(kpt_shape) >= 1:
+            try:
+                count = int(kpt_shape[0])
+                if count > 0:
+                    return count
+            except (TypeError, ValueError):
+                pass
+        if self._keypoint_labels is not None and len(self._keypoint_labels) > 0:
+            return len(self._keypoint_labels)
+        return len(ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS)
+
+    def _parse_result(self, result, conf_threshold: float) -> list[CourtKeypoint]:
+        """Parse a single Ultralytics result object into CourtKeypoint entries."""
+        kp_data = result.keypoints
+        if kp_data is None or kp_data.xy is None or len(kp_data.xy) == 0:
+            return []
+
+        # Take the first detected instance's keypoints
+        kps_xy = kp_data.xy[0]
+        kps_conf = kp_data.conf[0] if kp_data.conf is not None else None
+        keypoint_labels = self._keypoint_labels
+        if keypoint_labels is None and len(kps_xy) == 15:
+            keypoint_labels = ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS
+
+        keypoints: list[CourtKeypoint] = []
+        for i in range(len(kps_xy)):
+            x = float(kps_xy[i][0].item())
+            y = float(kps_xy[i][1].item())
+
+            conf = (
+                float(kps_conf[i].item())
+                if kps_conf is not None and i < len(kps_conf)
+                else 0.0
+            )
+
+            if conf < conf_threshold:
+                continue
+            if x == 0.0 and y == 0.0:
+                # Ultralytics zeroes out keypoints that were not detected
+                continue
+
+            label = (
+                keypoint_labels[i]
+                if keypoint_labels and i in keypoint_labels
+                else f"keypoint_{i}"
+            )
+
+            keypoints.append(
+                CourtKeypoint(label=label, pixel=PixelPoint(x=x, y=y), confidence=conf)
+            )
+
+        return keypoints
+
     def predict(
         self,
         image: np.ndarray,
@@ -385,39 +443,40 @@ class CourtKeypointDetector:
         results = self._model.predict(image, **predict_kwargs)
         if not results:
             return []
+        return self._parse_result(results[0], conf_threshold)
 
-        kp_data = results[0].keypoints
-        if kp_data is None or kp_data.xy is None or len(kp_data.xy) == 0:
+    def predict_batch(
+        self,
+        images: list[np.ndarray],
+        conf_threshold: float = 0.25,
+        imgsz: Optional[int] = None,
+        device: Optional[str] = None,
+    ) -> list[list[CourtKeypoint]]:
+        """Run batched inference on a list of BGR images.
+
+        Parameters
+        ----------
+        images:
+            List of BGR images (H×W×3, uint8).
+        conf_threshold:
+            Minimum keypoint confidence threshold.
+
+        Returns
+        -------
+        list[list[CourtKeypoint]]
+            One list of detected keypoints per input image.
+        """
+        if not images:
             return []
-
-        # Take the first detected instance's keypoints
-        kps_xy = kp_data.xy[0]
-        kps_conf = kp_data.conf[0] if kp_data.conf is not None else None
-        keypoint_labels = self._keypoint_labels
-        if keypoint_labels is None and len(kps_xy) == 15:
-            keypoint_labels = ROBOFLOW_TENNIS_COURT_15_KEYPOINT_LABELS
-
-        keypoints: list[CourtKeypoint] = []
-        for i in range(len(kps_xy)):
-            x = float(kps_xy[i][0].item())
-            y = float(kps_xy[i][1].item())
-
-            conf = float(kps_conf[i].item()) if kps_conf is not None and i < len(kps_conf) else 0.0
-
-            if conf < conf_threshold:
-                continue
-            if x == 0.0 and y == 0.0:
-                # Ultralytics zeroes out keypoints that were not detected
-                continue
-
-            label = (
-                keypoint_labels[i]
-                if keypoint_labels and i in keypoint_labels
-                else f"keypoint_{i}"
-            )
-
-            keypoints.append(
-                CourtKeypoint(label=label, pixel=PixelPoint(x=x, y=y), confidence=conf)
-            )
-
-        return keypoints
+        predict_kwargs = {"conf": conf_threshold, "verbose": False}
+        if imgsz is not None:
+            predict_kwargs["imgsz"] = imgsz
+        if device is not None:
+            predict_kwargs["device"] = device
+        results = self._model.predict(images, **predict_kwargs)
+        if not results:
+            return [[] for _ in images]
+        parsed = [self._parse_result(res, conf_threshold) for res in results]
+        while len(parsed) < len(images):
+            parsed.append([])
+        return parsed[: len(images)]
